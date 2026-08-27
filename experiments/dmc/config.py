@@ -746,13 +746,14 @@ def _validate_evaluation_and_gates(raw: dict[str, Any]) -> None:
         )
     if reference_episodes > evaluation["episodes_per_seed"]:
         raise ValueError("reference episodes cannot exceed robustness episodes")
-    if (
-        _positive_int(
-            evaluation, "diagnostic_every_steps", section="evaluation"
+    diagnostic_every_steps = _positive_int(
+        evaluation, "diagnostic_every_steps", section="evaluation"
+    )
+    if diagnostic_every_steps % 50_000:
+        raise ValueError(
+            "evaluation.diagnostic_every_steps must be a positive multiple "
+            "of 50000"
         )
-        != 50_000
-    ):
-        raise ValueError("evaluation.diagnostic_every_steps must be 50000")
     if _require_bool(evaluation, "deterministic", section="evaluation") is not True:
         raise ValueError("Primary evaluation must use deterministic actor means")
     if evaluation["checkpoint"] != "latest":
