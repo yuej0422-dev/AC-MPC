@@ -32,6 +32,13 @@ import numpy as np
 
 
 EnvFactory = Callable[..., Any]
+_NUMPY_RANDOM_STATE_SEED_MODULUS = 2**32
+
+
+def _numpy_random_state_seed(seed: int) -> int:
+    """Map deterministic counters into NumPy RandomState's uint32 domain."""
+
+    return int(seed) % _NUMPY_RANDOM_STATE_SEED_MODULUS
 
 
 @dataclass(frozen=True)
@@ -118,7 +125,9 @@ class SyncDMCVectorEnv:
         try:
             for index in range(self.num_envs):
                 env_kwargs = {
-                    "seed": self.seed + self._index_offset + index,
+                    "seed": _numpy_random_state_seed(
+                        self.seed + self._index_offset + index
+                    ),
                     "control_timestep": control_timestep,
                     "time_limit": time_limit,
                 }
@@ -181,7 +190,7 @@ class SyncDMCVectorEnv:
     def _reset_seed(self, index: int) -> int:
         # Seeds are unique across env indices and episode counts, while the
         # complete sequence remains reproducible from the training seed.
-        return (
+        return _numpy_random_state_seed(
             self.seed
             + self._index_offset
             + index

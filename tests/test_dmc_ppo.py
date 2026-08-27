@@ -137,6 +137,35 @@ def fake_env_factory(
     return FakeDMCEnv(task_name, seed, control_timestep, time_limit)
 
 
+def test_vector_env_wraps_continuation_seeds_into_random_state_domain() -> None:
+    class StrictSeedEnv(FakeDMCEnv):
+        def __init__(self, task_name: str, seed: int, **kwargs) -> None:
+            assert 0 <= seed < 2**32
+            super().__init__(task_name, seed, **kwargs)
+
+        def reset(self, seed: int | None = None) -> np.ndarray:
+            assert seed is None or 0 <= seed < 2**32
+            return super().reset(seed)
+
+    def strict_factory(task_name: str, seed: int, **kwargs) -> StrictSeedEnv:
+        return StrictSeedEnv(task_name, seed, **kwargs)
+
+    env = SyncDMCVectorEnv(
+        "cartpole_swingup",
+        2,
+        2**32 + 17,
+        env_factory=strict_factory,
+    )
+    try:
+        env.reset()
+        env.step(np.zeros((2, 1), dtype=np.float32))
+        step = env.step(np.zeros((2, 1), dtype=np.float32))
+        assert np.all(step.reset_seed >= 0)
+        assert np.all(step.reset_seed < 2**32)
+    finally:
+        env.close()
+
+
 def _cli_base(tmp_path: Path) -> list[str]:
     return [
         "--config",
@@ -1124,6 +1153,108 @@ def test_ppo_single_update_checkpoint_collection_and_resume(tmp_path: Path) -> N
     ] == [2, 2, 0]
     assert json.loads((output / "status.json").read_text())["state"] == "complete"
     assert not list(output.glob("*.tmp"))
+
+
+def test_ppo_continuation_runs_a_full_additional_budget_in_new_directory(
+    tmp_path: Path,
+) -> None:
+    source_output = tmp_path / "source"
+    continuation_output = tmp_path / "continuation"
+    actor_config = ActorConfig(ppo_hidden_dim=8)
+    config = _smoke_config(8)
+
+    source = train(
+        "cartpole_swingup",
+        "PPO",
+        source_output,
+        config,
+        actor_config=actor_config,
+        device_name="cpu",
+        resume=False,
+        env_factory=fake_env_factory,
+        _test_authorization=_TEST_ONLY_AUTHORIZATION,
+    )
+    source_checkpoint = source_output / "latest.pt"
+    source_bytes = source_checkpoint.read_bytes()
+    assert source["update"] == 2
+    assert source["global_step"] == 8
+
+    continued = train(
+        "cartpole_swingup",
+        "PPO",
+        continuation_output,
+        config,
+        actor_config=actor_config,
+        device_name="cpu",
+        resume=True,
+        continuation_checkpoint=source_checkpoint,
+        env_factory=fake_env_factory,
+        _test_authorization=_TEST_ONLY_AUTHORIZATION,
+    )
+
+    assert source_checkpoint.read_bytes() == source_bytes
+    assert continued["update"] == 4
+    assert continued["global_step"] == 16
+    lineage = continued["continuation_lineage"]
+    assert lineage["source_update"] == 2
+    assert lineage["source_global_step"] == 8
+    assert lineage["additional_updates"] == 2
+    assert lineage["additional_environment_steps"] == 8
+    assert lineage["target_update"] == 4
+    assert lineage["target_global_step"] == 16
+    checkpoint = torch.load(
+        continuation_output / "latest.pt", weights_only=False
+    )
+    assert checkpoint["continuation_lineage"] == lineage
+    rows = [
+        json.loads(line)
+        for line in (continuation_output / "metrics.jsonl").read_text().splitlines()
+    ]
+    assert [row["update"] for row in rows] == [3, 4]
+
+    resumed_complete = train(
+        "cartpole_swingup",
+        "PPO",
+        continuation_output,
+        config,
+        actor_config=actor_config,
+        device_name="cpu",
+        resume=True,
+        continuation_checkpoint=source_checkpoint,
+        env_factory=fake_env_factory,
+        _test_authorization=_TEST_ONLY_AUTHORIZATION,
+    )
+    assert resumed_complete["update"] == 4
+    assert resumed_complete["global_step"] == 16
+
+
+def test_ppo_continuation_rejects_collection_and_no_resume(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "source.pt"
+    checkpoint.write_bytes(b"not loaded because validation is earlier")
+    config = _smoke_config(8)
+
+    with pytest.raises(ValueError, match="requires resume=True"):
+        train(
+            "cartpole_swingup",
+            "PPO",
+            tmp_path / "no_resume",
+            config,
+            resume=False,
+            continuation_checkpoint=checkpoint,
+            env_factory=fake_env_factory,
+            _test_authorization=_TEST_ONLY_AUTHORIZATION,
+        )
+    with pytest.raises(ValueError, match="without collection"):
+        train(
+            "cartpole_swingup",
+            "PPO",
+            tmp_path / "collection",
+            config,
+            collect_dir=tmp_path / "data",
+            continuation_checkpoint=checkpoint,
+            env_factory=fake_env_factory,
+            _test_authorization=_TEST_ONLY_AUTHORIZATION,
+        )
 
 
 def test_collection_checkpoint_and_metrics_resume_at_noninterval_update(

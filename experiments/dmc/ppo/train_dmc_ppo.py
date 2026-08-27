@@ -1844,6 +1844,7 @@ def train(
     device_name: str = "auto",
     env_workers: int | None = None,
     resume: bool = True,
+    continuation_checkpoint: Path | None = None,
     env_factory: EnvFactory | None = None,
     collection_seed_index: int = 0,
     collection_seed_dir: str | None = None,
@@ -1880,6 +1881,13 @@ def train(
     ):
         raise ValueError(
             "mpve_horizon cannot exceed ActorConfig.kmpc_horizon"
+        )
+    if continuation_checkpoint is not None and not resume:
+        raise ValueError("continuation_checkpoint requires resume=True")
+    if continuation_checkpoint is not None and collect_dir is not None:
+        raise ValueError(
+            "checkpoint continuation must train without collection; collect "
+            "from immutable stage checkpoints in a separate phase"
         )
     if collect_dir is not None and config.collect_max_transitions is None:
         raise ValueError(
@@ -1944,9 +1952,82 @@ def train(
 
     resume_payload: dict[str, Any] | None = None
     start_update = 0
-    if resume and latest_path.exists():
+    continuation_lineage: dict[str, Any] | None = None
+    resuming_output = bool(resume and latest_path.exists())
+    if resuming_output:
         resume_payload = torch.load(latest_path, map_location="cpu", weights_only=False)
         start_update = int(resume_payload.get("update", 0))
+    elif continuation_checkpoint is not None:
+        continuation_checkpoint = Path(continuation_checkpoint)
+        if not continuation_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Continuation checkpoint does not exist: {continuation_checkpoint}"
+            )
+        if continuation_checkpoint.resolve() == latest_path.resolve():
+            raise ValueError(
+                "continuation_checkpoint must be outside the new output directory"
+            )
+        resume_payload = torch.load(
+            continuation_checkpoint, map_location="cpu", weights_only=False
+        )
+        start_update = int(resume_payload.get("update", 0))
+
+    if continuation_checkpoint is not None:
+        continuation_checkpoint = Path(continuation_checkpoint).resolve()
+        source_sha256 = _sha256(continuation_checkpoint)
+        if resuming_output:
+            raw_lineage = resume_payload.get("continuation_lineage")
+            if not isinstance(raw_lineage, dict):
+                raise ValueError(
+                    "Continuation output checkpoint is missing continuation_lineage"
+                )
+            continuation_lineage = dict(raw_lineage)
+            expected_source = {
+                "source_checkpoint": str(continuation_checkpoint),
+                "source_checkpoint_sha256": source_sha256,
+            }
+            mismatches = {
+                key: (continuation_lineage.get(key), value)
+                for key, value in expected_source.items()
+                if continuation_lineage.get(key) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    f"Continuation source lineage mismatch: {mismatches}"
+                )
+        else:
+            source_global_step = int(resume_payload.get("global_step", 0))
+            continuation_lineage = {
+                "kind": "dmc_ppo_additional_training_phase_v1",
+                "source_checkpoint": str(continuation_checkpoint),
+                "source_checkpoint_sha256": source_sha256,
+                "source_update": int(start_update),
+                "source_global_step": source_global_step,
+                "additional_updates": int(config.number_updates),
+                "additional_environment_steps": int(
+                    config.number_updates * config.batch_size
+                ),
+                "target_update": int(start_update + config.number_updates),
+                "target_global_step": int(
+                    source_global_step
+                    + config.number_updates * config.batch_size
+                ),
+            }
+
+    target_update = (
+        int(continuation_lineage["target_update"])
+        if continuation_lineage is not None
+        else config.number_updates
+    )
+    phase_start_update = (
+        int(continuation_lineage["source_update"])
+        if continuation_lineage is not None
+        else 0
+    )
+    if start_update > target_update:
+        raise ValueError(
+            f"Checkpoint update {start_update} exceeds target update {target_update}"
+        )
 
     _seed_all(config.seed)
     device = torch.device(
@@ -2296,6 +2377,8 @@ def train(
             "network_initialization_contract": network_initialization_contract,
             **authorization_metadata,
         }
+        if resuming_output and continuation_lineage is not None:
+            expected["continuation_lineage"] = continuation_lineage
         mismatches = {
             key: (resume_payload.get(key), value)
             for key, value in expected.items()
@@ -2346,6 +2429,7 @@ def train(
         "value_expansion": value_expansion_metadata,
         "gradient_clip_contract": gradient_clip_contract,
         "network_initialization_contract": network_initialization_contract,
+        "continuation_lineage": continuation_lineage,
         "environment_runner": {
             "kind": (
                 "spawn_process_vector_v1"
@@ -2396,6 +2480,7 @@ def train(
             "training_approved": False,
             "device": str(device),
             "would_resume_from_update": start_update,
+            "target_update": target_update,
             "optimization_steps": 0,
             "environment_steps": 0,
             "notice": (
@@ -2413,6 +2498,7 @@ def train(
             "config_fingerprint": authorization_metadata["config_fingerprint"],
             "run_manifest": str(manifest_path.resolve()),
             "would_resume_from_update": start_update,
+            "target_update": target_update,
             "optimization_steps": 0,
             "environment_steps": 0,
         }
@@ -2449,6 +2535,8 @@ def train(
             **metadata,
             "device": str(device),
             "resume_from_update": start_update,
+            "target_update": target_update,
+            "phase_start_update": phase_start_update,
         },
     )
     collector = (
@@ -2544,7 +2632,7 @@ def train(
     running_returns = np.zeros(config.num_envs, dtype=np.float64)
     running_lengths = np.zeros(config.num_envs, dtype=np.int64)
     metrics_path = output_dir / "metrics.jsonl"
-    if resume_payload is not None:
+    if resuming_output:
         _truncate_metrics_to_checkpoint(metrics_path, start_update)
     observations = vector_env.reset()
     started = time.perf_counter()
@@ -2576,9 +2664,10 @@ def train(
         }
 
     try:
-        for update in range(start_update + 1, config.number_updates + 1):
+        for update in range(start_update + 1, target_update + 1):
+            phase_update = update - phase_start_update
             if config.anneal_learning_rate:
-                fraction = 1.0 - (update - 1.0) / config.number_updates
+                fraction = 1.0 - (phase_update - 1.0) / config.number_updates
                 for group in optimizer.param_groups:
                     group["lr"] = fraction * config.learning_rate
 
@@ -3088,7 +3177,7 @@ def train(
             )
             scheduled_checkpoint = (
                 update % config.checkpoint_interval_updates == 0
-                or update == config.number_updates
+                or update == target_update
                 or should_stop
             )
             # Collection chunks are committed once per completed PPO update.
@@ -3169,6 +3258,7 @@ def train(
         "collection_budget": (
             collector.budget_report() if collector is not None else None
         ),
+        "continuation_lineage": continuation_lineage,
     }
     _atomic_json(output_dir / "final.json", final)
     _atomic_json(output_dir / "status.json", {"state": "complete", **final})
@@ -3193,6 +3283,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-resume", action="store_true")
     parser.add_argument(
+        "--continue-from",
+        dest="continuation_checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "start a new output directory with optimizer, actor, critic, RNG, "
+            "and normalization state restored from this checkpoint, then run "
+            "the full YAML-bound training budget as an additional phase"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="write a non-authorizing run manifest; never construct an optimizer",
@@ -3216,6 +3317,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--no-collect and --collect-dir are mutually exclusive")
     if args.no_collect and args.actor != "PPO":
         parser.error("--no-collect is only meaningful for the plain PPO actor")
+    if args.no_resume and args.continuation_checkpoint is not None:
+        parser.error("--no-resume and --continue-from are mutually exclusive")
     return args
 
 
@@ -3246,6 +3349,7 @@ def main(argv: list[str] | None = None) -> None:
         device_name=args.device,
         env_workers=args.env_workers,
         resume=not args.no_resume and not args.dry_run,
+        continuation_checkpoint=args.continuation_checkpoint,
         collection_seed_index=args.train_seed_index,
         collection_seed_dir=f"seed_{config.seed}",
         experiment_config=experiment,
