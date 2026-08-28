@@ -85,9 +85,10 @@ def run(args: argparse.Namespace) -> None:
         config["num_timesteps"] = args.timesteps
     config["seed"] = args.seed
     config["max_devices_per_host"] = 1
-    # Formal comparison evaluates deterministic policy modes.  Playground's
-    # tuned learner settings remain unchanged.
-    config["deterministic_eval"] = True
+    # The official training script uses Brax's stochastic evaluation default.
+    # Existing project commands retain deterministic evaluation unless the
+    # caller explicitly requests the official behavior.
+    config["deterministic_eval"] = args.deterministic_eval
 
     metadata = {
         "kind": "mujoco_playground_ppo_run_v1",
@@ -145,6 +146,12 @@ def parse_args() -> argparse.Namespace:
         "--impl",
         choices=PLAYGROUND_IMPLS,
         help="Environment implementation; omit to preserve Playground's default.",
+    )
+    parser.add_argument(
+        "--deterministic-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the policy mode for in-training evaluation.",
     )
     parser.add_argument("--timesteps", type=int)
     parser.add_argument("--smoke", action="store_true")

@@ -57,7 +57,7 @@ def run(args: argparse.Namespace) -> None:
         config["num_timesteps"] = args.timesteps
     config["seed"] = args.seed
     config["max_devices_per_host"] = 1
-    config["deterministic_eval"] = True
+    config["deterministic_eval"] = args.deterministic_eval
     task = TASKS[args.task]
     kmpc_horizon = args.kmpc_horizon or task.kmpc_horizon_steps
     mpve_horizon = args.mpve_horizon or task.mpve_horizon_steps
@@ -180,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         "--impl",
         choices=PLAYGROUND_IMPLS,
         help="Environment implementation; use the same value across all methods.",
+    )
+    parser.add_argument(
+        "--deterministic-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the policy mode for in-training evaluation.",
     )
     parser.add_argument("--timesteps", type=int)
     parser.add_argument("--kmpc-horizon", type=int)
