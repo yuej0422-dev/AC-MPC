@@ -15,6 +15,7 @@ from experiments.dmc.o2o.train import (
 )
 from experiments.dmc.ppo.vector_env import ProcessDMCVectorEnv, SyncDMCVectorEnv
 from experiments.dmc.tasks.adapter import make_dmc_adapter
+from experiments.hopper_hop.formal_o2o import session_name, training_command
 
 
 def test_hopper_hop_is_an_explicit_recorded_reward_o2o_task() -> None:
@@ -47,6 +48,39 @@ def test_hopper_hop_structured_methods_require_koopman() -> None:
     assert O2OConfig(task=TASK, method="Cal-RLPD-KMPC").requires_koopman
     assert O2OConfig(task=TASK, method="Cal-RLPD-Lift").requires_koopman
     assert not O2OConfig(task=TASK, method="Cal-RLPD").requires_koopman
+
+
+def test_maniskill_formal_non_bc_offline_learning_rate_override() -> None:
+    dataset = SimpleNamespace(path="/tmp/dataset.npz")
+    koopman = SimpleNamespace(path="/tmp/koopman.npz")
+    for method in ("Cal-RLPD-KMPC", "Cal-RLPD", "Cal-RLPD-Lift", "Cal-QL"):
+        command = training_command(
+            method=method,
+            seed=20260852,
+            dataset=dataset,
+            koopman=koopman,
+            output=SimpleNamespace(resolve=lambda: "/tmp/output"),
+            device="cuda",
+            non_bc_offline_learning_rate=6e-4,
+        )
+        assert command.count("0.0006") == 2
+
+    for method in ("RLPD", "AWAC", "IQL"):
+        command = training_command(
+            method=method,
+            seed=20260852,
+            dataset=dataset,
+            koopman=koopman,
+            output=SimpleNamespace(resolve=lambda: "/tmp/output"),
+            device="cuda",
+            non_bc_offline_learning_rate=6e-4,
+        )
+        assert "--offline-actor-learning-rate" not in command
+        assert "--offline-critic-learning-rate" not in command
+
+    assert session_name(20260852, "Cal-RLPD-KMPC", "lr6e4") == (
+        "ms_hop_20260852_cal_rlpd_kmpc_lr6e4"
+    )
 
 
 def test_hopper_hop_o2o_pins_dataset_and_environment_to_ar2() -> None:

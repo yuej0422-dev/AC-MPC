@@ -8,6 +8,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ TASK = "hopper_hop"
 BACKEND = "maniskill_hopper_hop"
 EPISODE_HORIZON = 600
 STRUCTURED_METHODS = frozenset({"Cal-RLPD-KMPC", "Cal-RLPD-Lift"})
+BC_METHODS = frozenset({"AWAC", "IQL"})
 STRUCTURED_OFFLINE_LEARNING_RATE = 1e-4
 
 
@@ -106,7 +108,7 @@ def validate_koopman(path: Path) -> FrozenKoopman:
 
 def training_command(
     *, method: str, seed: int, dataset: OfflineDataset, koopman: FrozenKoopman,
-    output: Path, device: str,
+    output: Path, device: str, non_bc_offline_learning_rate: float | None = None,
 ) -> list[str]:
     config = O2OConfig(
         task=TASK, method=method, environment_backend=BACKEND, seed=seed
@@ -131,20 +133,47 @@ def training_command(
     ]
     if config.requires_koopman:
         command.extend(("--koopman", str(koopman.path)))
-    if method in STRUCTURED_METHODS:
+    offline_learning_rate = None
+    if (
+        non_bc_offline_learning_rate is not None
+        and method not in BC_METHODS
+        and config.method_spec.offline_pretraining
+    ):
+        offline_learning_rate = non_bc_offline_learning_rate
+    elif method in STRUCTURED_METHODS:
+        offline_learning_rate = STRUCTURED_OFFLINE_LEARNING_RATE
+    if offline_learning_rate is not None:
         command.extend(
             (
                 "--offline-actor-learning-rate",
-                str(STRUCTURED_OFFLINE_LEARNING_RATE),
+                str(offline_learning_rate),
                 "--offline-critic-learning-rate",
-                str(STRUCTURED_OFFLINE_LEARNING_RATE),
+                str(offline_learning_rate),
             )
         )
     return command
 
 
-def session_name(seed: int, method: str) -> str:
-    return f"ms_hop_{seed}_{method}".lower().replace("-", "_")
+def session_name(seed: int, method: str, tag: str | None = None) -> str:
+    suffix = f"_{tag}" if tag else ""
+    return f"ms_hop_{seed}_{method}{suffix}".lower().replace("-", "_")
+
+
+def gpu_memory_used_mib() -> int:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    values = [int(line.strip()) for line in result.stdout.splitlines() if line.strip()]
+    if not values:
+        raise RuntimeError("nvidia-smi returned no GPU memory values")
+    return max(values)
 
 
 def main() -> None:
@@ -156,8 +185,25 @@ def main() -> None:
     parser.add_argument("--koopman", type=Path, required=True)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--non-bc-offline-learning-rate", type=float)
+    parser.add_argument("--session-tag")
+    parser.add_argument("--launch-max-gpu-memory-mib", type=int)
+    parser.add_argument("--launch-stagger-seconds", type=int, default=0)
+    parser.add_argument("--resource-poll-seconds", type=int, default=60)
     parser.add_argument("--launch", action="store_true")
     args = parser.parse_args()
+    if (
+        args.non_bc_offline_learning_rate is not None
+        and args.non_bc_offline_learning_rate <= 0
+    ):
+        parser.error("--non-bc-offline-learning-rate must be positive")
+    if (
+        args.launch_max_gpu_memory_mib is not None
+        and args.launch_max_gpu_memory_mib <= 0
+    ):
+        parser.error("--launch-max-gpu-memory-mib must be positive")
+    if args.launch_stagger_seconds < 0 or args.resource_poll_seconds <= 0:
+        parser.error("launch stagger must be nonnegative and resource polling must be positive")
 
     dataset = validate_dataset(args.dataset)
     koopman = validate_koopman(args.koopman)
@@ -170,9 +216,23 @@ def main() -> None:
             koopman=koopman,
             output=seed_root / method,
             device=args.device,
+            non_bc_offline_learning_rate=args.non_bc_offline_learning_rate,
         )
         for method in FORMAL_METHODS
     }
+    effective_offline_learning_rates = {}
+    for method in FORMAL_METHODS:
+        config = O2OConfig(
+            task=TASK, method=method, environment_backend=BACKEND, seed=args.training_seed
+        )
+        if not config.method_spec.offline_pretraining:
+            effective_offline_learning_rates[method] = None
+        elif args.non_bc_offline_learning_rate is not None and method not in BC_METHODS:
+            effective_offline_learning_rates[method] = args.non_bc_offline_learning_rate
+        elif method in STRUCTURED_METHODS:
+            effective_offline_learning_rates[method] = STRUCTURED_OFFLINE_LEARNING_RATE
+        else:
+            effective_offline_learning_rates[method] = config.actor_learning_rate
     plan = {
         "kind": "acmpc_maniskill_hopper_hop_formal_seed_v1",
         "task": TASK,
@@ -201,10 +261,25 @@ def main() -> None:
             "diagnostic_episodes_vectorized_on_gpu": FORMAL_DIAGNOSTIC_EPISODES,
             "kmpc_horizon": FORMAL_KMPC_HORIZON,
             "mpve_horizon": FORMAL_MPVE_HORIZON,
-            "structured_offline_actor_learning_rate": STRUCTURED_OFFLINE_LEARNING_RATE,
-            "structured_offline_critic_learning_rate": STRUCTURED_OFFLINE_LEARNING_RATE,
+            "default_structured_offline_actor_learning_rate": (
+                STRUCTURED_OFFLINE_LEARNING_RATE
+            ),
+            "default_structured_offline_critic_learning_rate": (
+                STRUCTURED_OFFLINE_LEARNING_RATE
+            ),
             "online_actor_learning_rate": 3e-4,
             "online_critic_learning_rate": 3e-4,
+            "non_bc_offline_learning_rate_override": args.non_bc_offline_learning_rate,
+            "bc_methods_unchanged": sorted(BC_METHODS),
+            "effective_offline_actor_critic_learning_rates": effective_offline_learning_rates,
+            "rlpd_offline_learning_rate": None,
+            "rlpd_note": "No offline pretraining; online learning rates remain unchanged.",
+        },
+        "launcher": {
+            "session_tag": args.session_tag,
+            "max_gpu_memory_mib_before_launch": args.launch_max_gpu_memory_mib,
+            "stagger_seconds": args.launch_stagger_seconds,
+            "resource_poll_seconds": args.resource_poll_seconds,
         },
         "commands": {method: shlex.join(command) for method, command in commands.items()},
     }
@@ -215,7 +290,7 @@ def main() -> None:
             continue
         output = seed_root / method
         output.mkdir(parents=True, exist_ok=True)
-        name = session_name(args.training_seed, method)
+        name = session_name(args.training_seed, method, args.session_tag)
         exists = subprocess.run(
             ["tmux", "has-session", "-t", f"={name}"],
             stdout=subprocess.DEVNULL,
@@ -224,6 +299,17 @@ def main() -> None:
         if exists:
             print(f"existing tmux session retained: {name}", flush=True)
             continue
+        if args.launch_max_gpu_memory_mib is not None:
+            while True:
+                used_mib = gpu_memory_used_mib()
+                if used_mib <= args.launch_max_gpu_memory_mib:
+                    break
+                print(
+                    f"waiting to launch {method}: GPU memory {used_mib} MiB exceeds "
+                    f"{args.launch_max_gpu_memory_mib} MiB",
+                    flush=True,
+                )
+                time.sleep(args.resource_poll_seconds)
         log_path = output / "training.log"
         shell_command = (
             f"cd {shlex.quote(str(Path.cwd()))} && "
@@ -234,6 +320,8 @@ def main() -> None:
             check=True,
         )
         print(f"launched tmux={name} log={log_path}", flush=True)
+        if args.launch_stagger_seconds:
+            time.sleep(args.launch_stagger_seconds)
 
 
 if __name__ == "__main__":
