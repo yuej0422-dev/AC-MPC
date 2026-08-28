@@ -249,6 +249,9 @@ def collect(config: CollectConfig) -> dict[str, Any]:
         raise ValueError("exploration_scale must be finite and non-negative")
     if not 0 < config.gamma <= 1:
         raise ValueError("gamma must lie in (0, 1]")
+    manifest_path = config.output.with_suffix(".manifest.json")
+    if config.output.exists() or manifest_path.exists():
+        raise FileExistsError("Quality-mix output already exists; refusing overwrite")
     device = torch.device(config.device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA collection requested but CUDA is unavailable")
@@ -392,7 +395,6 @@ def collect(config: CollectConfig) -> dict[str, Any]:
         "selection": loaded.metadata["selection"],
         "policy_sources": sources,
     }
-    manifest_path = config.output.with_suffix(".manifest.json")
     _atomic_json(manifest_path, manifest)
     print(
         f"wrote {len(loaded):,} transitions to {loaded.path} "
