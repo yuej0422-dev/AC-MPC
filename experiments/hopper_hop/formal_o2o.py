@@ -217,7 +217,7 @@ def main() -> None:
         output.mkdir(parents=True, exist_ok=True)
         name = session_name(args.training_seed, method)
         exists = subprocess.run(
-            ["tmux", "has-session", "-t", name],
+            ["tmux", "has-session", "-t", f"={name}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         ).returncode == 0

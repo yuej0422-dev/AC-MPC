@@ -1202,7 +1202,11 @@ def run(
         "algorithm_label": config.method_spec.profile,
         "calibration_reference": "finite_horizon_discounted_episode_return_v1",
         "online_collection": {
-            "runner": "ProcessDMCVectorEnv",
+            "runner": (
+                "ManiSkillHopperVectorEnv"
+                if config.environment_backend == "maniskill_hopper_hop"
+                else "ProcessDMCVectorEnv"
+            ),
             "num_envs": config.num_envs,
             "env_workers": config.env_workers,
             "online_step_counter": "total_real_environment_transitions",
