@@ -51,8 +51,9 @@ def export_checkpoint(source: Path, output: Path) -> dict[str, Any]:
     payload = torch.load(source, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise TypeError("Koopman checkpoint must contain a mapping")
-    if payload.get("kind") != "dmc_k_step_koopman":
-        raise ValueError("Only formal DMC Koopman best checkpoints are supported")
+    source_kind = payload.get("kind")
+    if source_kind not in {"dmc_k_step_koopman", "hopperhop_k_step_koopman"}:
+        raise ValueError("Only formal DMC or ManiSkill HopperHop checkpoints are supported")
     architecture = payload.get("architecture")
     if not isinstance(architecture, Mapping):
         raise ValueError("Koopman checkpoint is missing architecture")
@@ -60,10 +61,14 @@ def export_checkpoint(source: Path, output: Path) -> dict[str, Any]:
         raise ValueError("Unsupported Koopman architecture")
     model_state = payload.get("model_state")
     reward_state = payload.get("reward_model_state")
-    if not isinstance(model_state, Mapping) or not isinstance(reward_state, Mapping):
-        raise ValueError("Checkpoint is missing model or reward-model state")
+    if not isinstance(model_state, Mapping):
+        raise ValueError("Checkpoint is missing model state")
     encoder = _linear_layers(model_state, "encoder.")
-    reward = _linear_layers(reward_state, "network.")
+    reward = (
+        _linear_layers(reward_state, "network.")
+        if isinstance(reward_state, Mapping)
+        else []
+    )
     normalizer = payload.get("normalizer")
     if not isinstance(normalizer, Mapping):
         raise ValueError("Checkpoint is missing its state normalizer")
@@ -72,8 +77,8 @@ def export_checkpoint(source: Path, output: Path) -> dict[str, Any]:
         "kind": "playground_koopman_export_v1",
         "source_path": str(source.resolve()),
         "source_sha256": _sha256(source),
-        "source_checkpoint_kind": payload.get("checkpoint_kind"),
-        "task": payload.get("task"),
+        "source_checkpoint_kind": source_kind,
+        "task": payload.get("task", "hopper_hop" if source_kind == "hopperhop_k_step_koopman" else None),
         "architecture": dict(architecture),
         "reward_model_architecture": payload.get("reward_model_architecture"),
         "reward_model_input_contract": payload.get("reward_model_input_contract"),
@@ -88,6 +93,14 @@ def export_checkpoint(source: Path, output: Path) -> dict[str, Any]:
             "best_validation_reward_metrics"
         ),
         "dataset_sha256": payload.get("dataset_sha256"),
+        "state_kind": payload.get("state_kind"),
+        "k_step": payload.get("k_step", payload.get("config", {}).get("k_step")),
+        "seed": payload.get("config", {}).get("seed"),
+        "reward_training": (
+            payload.get("reward_training")
+            if reward
+            else "disabled; reward is outside the Koopman contract"
+        ),
         "source_protocol_fingerprint": payload.get("protocol_fingerprint"),
         "encoder_layer_count": len(encoder),
         "reward_layer_count": len(reward),
