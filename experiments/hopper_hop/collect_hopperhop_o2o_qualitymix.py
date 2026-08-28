@@ -165,6 +165,7 @@ def _rollout_policy(
             )
             clipped_components += int((sampled_action != applied_action).sum().item())
             total_action_components += int(sampled_action.numel())
+            observation = next_observation
         if not bool(torch.as_tensor(truncated).all()):
             raise RuntimeError("MS-HopperHop did not truncate every 600-step episode")
     finally:
