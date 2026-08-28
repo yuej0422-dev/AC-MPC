@@ -14,7 +14,12 @@ import numpy as np
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from experiments.playground.tasks import PLAYGROUND_COMMIT, TASKS, load_task
+from experiments.playground.tasks import (
+    PLAYGROUND_COMMIT,
+    PLAYGROUND_IMPLS,
+    TASKS,
+    load_task,
+)
 from experiments.playground.train_ppo import _atomic_json
 
 
@@ -97,7 +102,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         args.uniform_held_fraction,
     )
 
-    environment = load_task(args.task)
+    environment = load_task(args.task, impl=args.impl)
     reset_many = jax.vmap(environment.reset)
     step_many = jax.vmap(environment.step)
     networks = ppo_networks.make_ppo_networks(
@@ -156,6 +161,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     manifest: dict[str, Any] = {
         "kind": "mujoco_playground_koopman_collection_v1",
         "task": args.task,
+        "environment_impl": args.impl,
         "playground_commit": PLAYGROUND_COMMIT,
         "seed": args.seed,
         "num_envs_per_stage": args.num_envs,
@@ -251,6 +257,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=tuple(TASKS), required=True)
+    parser.add_argument(
+        "--impl",
+        choices=PLAYGROUND_IMPLS,
+        help="Environment implementation used to train the PPO checkpoints.",
+    )
     parser.add_argument("--checkpoint", type=Path, action="append", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-envs", type=int, default=1000)

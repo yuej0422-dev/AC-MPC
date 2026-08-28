@@ -17,7 +17,7 @@ from experiments.playground.structured_networks import (
     STRUCTURED_METHODS,
     make_structured_ppo_networks,
 )
-from experiments.playground.tasks import TASKS, load_task
+from experiments.playground.tasks import PLAYGROUND_IMPLS, TASKS, load_task
 from experiments.playground.train_ppo import _atomic_json, _json_value
 
 
@@ -47,7 +47,7 @@ def run(args: argparse.Namespace) -> dict:
     install_single_device_brax_compatibility()
     checkpoint_path = _latest_checkpoint(args.checkpoint.resolve())
     params = checkpoint.load(checkpoint_path)
-    environment = load_task(args.task)
+    environment = load_task(args.task, impl=args.impl)
     task = TASKS[args.task]
     kmpc_horizon = args.kmpc_horizon or task.kmpc_horizon_steps
     if args.method == "PPO":
@@ -94,6 +94,7 @@ def run(args: argparse.Namespace) -> dict:
         "kind": "mujoco_playground_deterministic_evaluation_v1",
         "task": args.task,
         "method": args.method,
+        "environment_impl": args.impl,
         "checkpoint": str(checkpoint_path),
         "checkpoint_step": int(checkpoint_path.name),
         "koopman": str(args.koopman.resolve()) if args.koopman else None,
@@ -116,6 +117,11 @@ def run(args: argparse.Namespace) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", choices=tuple(TASKS), required=True)
+    parser.add_argument(
+        "--impl",
+        choices=PLAYGROUND_IMPLS,
+        help="Environment implementation used by the checkpoint.",
+    )
     parser.add_argument("--method", choices=METHODS, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--koopman", type=Path)

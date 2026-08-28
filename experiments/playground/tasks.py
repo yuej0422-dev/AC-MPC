@@ -7,6 +7,7 @@ from typing import Any
 
 
 PLAYGROUND_COMMIT = "d5e6b47531328468da1eec33b8b304a00bb0873c"
+PLAYGROUND_IMPLS = ("jax", "warp")
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ TASKS: dict[str, PlaygroundTask] = {
 }
 
 
-def load_task(name: str):
+def load_task(name: str, *, impl: str | None = None):
     """Load and validate one official Playground environment lazily."""
 
     try:
@@ -121,8 +122,18 @@ def load_task(name: str):
 
     from mujoco_playground import registry
 
+    if impl is not None and impl not in PLAYGROUND_IMPLS:
+        raise ValueError(
+            f"Unknown Playground implementation {impl!r}; "
+            f"expected one of {PLAYGROUND_IMPLS}"
+        )
     config = registry.get_default_config(name)
-    environment = registry.load(name, config=config)
+    config_overrides = {"impl": impl} if impl is not None else None
+    environment = registry.load(
+        name,
+        config=config,
+        config_overrides=config_overrides,
+    )
     actual = {
         "observation_dim": int(environment.observation_size),
         "action_dim": int(environment.action_size),

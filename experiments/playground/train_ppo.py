@@ -19,7 +19,12 @@ from typing import Any
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-from experiments.playground.tasks import PLAYGROUND_COMMIT, TASKS, load_task
+from experiments.playground.tasks import (
+    PLAYGROUND_COMMIT,
+    PLAYGROUND_IMPLS,
+    TASKS,
+    load_task,
+)
 from experiments.playground.jax_compat import install_single_device_brax_compatibility
 
 
@@ -90,6 +95,7 @@ def run(args: argparse.Namespace) -> None:
         "method": "PPO",
         "seed": args.seed,
         "smoke": bool(args.smoke),
+        "environment_impl": args.impl,
         "playground_commit": PLAYGROUND_COMMIT,
         "jax_version": jax.__version__,
         "python_version": platform.python_version(),
@@ -114,8 +120,8 @@ def run(args: argparse.Namespace) -> None:
         reward = row.get("eval/episode_reward")
         print(f"step={step} eval_return={reward} metrics={len(row) - 2}", flush=True)
 
-    environment = load_task(args.task)
-    eval_environment = load_task(args.task)
+    environment = load_task(args.task, impl=args.impl)
+    eval_environment = load_task(args.task, impl=args.impl)
     checkpoint_dir = output / "checkpoints"
     ppo.train(
         environment=environment,
@@ -135,6 +141,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", choices=tuple(TASKS), required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--impl",
+        choices=PLAYGROUND_IMPLS,
+        help="Environment implementation; omit to preserve Playground's default.",
+    )
     parser.add_argument("--timesteps", type=int)
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()

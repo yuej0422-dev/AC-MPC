@@ -19,7 +19,12 @@ from experiments.playground.structured_networks import (
     STRUCTURED_METHODS,
     make_structured_ppo_networks,
 )
-from experiments.playground.tasks import PLAYGROUND_COMMIT, TASKS, load_task
+from experiments.playground.tasks import (
+    PLAYGROUND_COMMIT,
+    PLAYGROUND_IMPLS,
+    TASKS,
+    load_task,
+)
 from experiments.playground.train_ppo import (
     _atomic_json,
     _json_value,
@@ -91,6 +96,7 @@ def run(args: argparse.Namespace) -> None:
         "method": args.method,
         "seed": args.seed,
         "smoke": bool(args.smoke),
+        "environment_impl": args.impl,
         "playground_commit": PLAYGROUND_COMMIT,
         "jax_version": jax.__version__,
         "python_version": platform.python_version(),
@@ -147,8 +153,8 @@ def run(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-    environment = load_task(args.task)
-    eval_environment = load_task(args.task)
+    environment = load_task(args.task, impl=args.impl)
+    eval_environment = load_task(args.task, impl=args.impl)
     ppo.train(
         environment=environment,
         eval_env=eval_environment,
@@ -170,6 +176,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--koopman", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--impl",
+        choices=PLAYGROUND_IMPLS,
+        help="Environment implementation; use the same value across all methods.",
+    )
     parser.add_argument("--timesteps", type=int)
     parser.add_argument("--kmpc-horizon", type=int)
     parser.add_argument("--mpve-horizon", type=int)
