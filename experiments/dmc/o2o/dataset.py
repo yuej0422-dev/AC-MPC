@@ -22,6 +22,7 @@ from experiments.dmc.tasks.registry import get_task_spec
 DATASET_KIND = "acmpc_exorl_cartpole_transitions_v1"
 WALKER_DATASET_KIND = "acmpc_exorl_walker_run_transitions_v1"
 TDMPC2_DATASET_KIND = "acmpc_tdmpc2_dmc_transitions_v1"
+MANISKILL_HOPPER_DATASET_KIND = "acmpc_maniskill_hopper_hop_transitions_v1"
 DATASET_KEYS = (
     "observation",
     "action",
@@ -680,15 +681,18 @@ class OfflineDataset:
                     episode_end & ~terminated
                 ).astype(np.bool_, copy=False)
         task = str(metadata.get("task", "cartpole_swingup"))
-        expected_kind = {
-            "cartpole_swingup": DATASET_KIND,
-            "walker_run": WALKER_DATASET_KIND,
-            "hopper_stand": TDMPC2_DATASET_KIND,
-            "hopper_hop": TDMPC2_DATASET_KIND,
+        expected_kinds = {
+            "cartpole_swingup": {DATASET_KIND},
+            "walker_run": {WALKER_DATASET_KIND},
+            "hopper_stand": {TDMPC2_DATASET_KIND},
+            "hopper_hop": {
+                TDMPC2_DATASET_KIND,
+                MANISKILL_HOPPER_DATASET_KIND,
+            },
         }.get(task)
-        if expected_kind is None:
+        if expected_kinds is None:
             raise ValueError(f"Unsupported offline dataset task {task!r}")
-        if metadata.get("kind") != expected_kind:
+        if metadata.get("kind") not in expected_kinds:
             raise ValueError("Unsupported offline dataset kind")
         gamma = float(metadata.get("gamma_for_mc_return", float("nan")))
         if not math.isfinite(gamma) or not 0 < gamma <= 1:
