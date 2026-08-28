@@ -30,6 +30,7 @@ OnlineCQLMode = Literal["all_valid_mc", "off"]
 NetworkProfile = Literal["exorl_cql", "rlpd"]
 MPVEScope = Literal["off", "offline_only", "online_only", "both"]
 LearnerFamily = Literal["sac", "awac", "iql"]
+EnvironmentBackend = Literal["dmc", "maniskill_hopper_hop"]
 
 
 @dataclass(frozen=True)
@@ -333,6 +334,7 @@ TRAIN_METHODS = tuple(TRAIN_METHOD_SPECS)
 @dataclass(frozen=True)
 class O2OConfig:
     task: str = "cartpole_swingup"
+    environment_backend: EnvironmentBackend = "dmc"
     method: str = "Cal-RLPD-Raw"
     seed: int = 20260821
     device: str = "cuda"
@@ -456,6 +458,10 @@ class O2OConfig:
         return TRAIN_METHOD_SPECS[self.method]
 
     def validate(self) -> None:
+        if self.environment_backend not in ("dmc", "maniskill_hopper_hop"):
+            raise ValueError("Unsupported O2O environment backend")
+        if self.environment_backend == "maniskill_hopper_hop" and self.task != "hopper_hop":
+            raise ValueError("The ManiSkill backend is only valid for hopper_hop")
         if self.task not in SUPPORTED_O2O_TASKS:
             raise ValueError(
                 f"Unsupported O2O task {self.task!r}; expected "
@@ -638,6 +644,10 @@ class O2OConfig:
         ):
             if serialized[name] is None:
                 serialized.pop(name)
+        # Preserve fingerprints for completed DMC checkpoints created before
+        # the simulator backend became explicit.
+        if serialized["environment_backend"] == "dmc":
+            serialized.pop("environment_backend")
         return serialized
 
     def learning_rate_for_phase(

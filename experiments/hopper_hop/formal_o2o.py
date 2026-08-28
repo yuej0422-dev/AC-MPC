@@ -1,0 +1,240 @@
+"""Formal seven-method O2O campaign for native ManiSkill HopperHop."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from experiments.dmc.o2o.config import O2OConfig
+from experiments.dmc.o2o.dataset import (
+    MANISKILL_HOPPER_DATASET_KIND,
+    OfflineDataset,
+)
+from experiments.dmc.o2o.formal_hopper import (
+    FORMAL_DIAGNOSTIC_EPISODES,
+    FORMAL_KMPC_HORIZON,
+    FORMAL_METHODS,
+    FORMAL_MPVE_HORIZON,
+    FORMAL_OFFLINE_EVAL_INTERVAL,
+    FORMAL_OFFLINE_TRANSITIONS,
+    FORMAL_OFFLINE_UPDATES,
+    FORMAL_ONLINE_EVAL_INTERVAL,
+    FORMAL_ONLINE_TRANSITIONS,
+    FORMAL_TRAINING_SEEDS,
+)
+from experiments.dmc.o2o.koopman import FrozenKoopman, file_sha256
+
+
+TASK = "hopper_hop"
+BACKEND = "maniskill_hopper_hop"
+EPISODE_HORIZON = 600
+STRUCTURED_METHODS = frozenset({"Cal-RLPD-KMPC", "Cal-RLPD-Lift"})
+STRUCTURED_OFFLINE_LEARNING_RATE = 1e-4
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def validate_dataset(path: Path) -> OfflineDataset:
+    dataset = OfflineDataset.load(path.resolve())
+    selection = dataset.metadata.get("selection", {})
+    expected = {
+        "kind": "maniskill_hopper_hop_ppo_qualitymix_equal_v1",
+        "policy_seeds": [20_240_801, 20_240_802, 20_240_803, 20_240_804],
+        "transitions_per_policy": 50_000,
+        "equal_policy_weight": True,
+    }
+    mismatches = {
+        key: {"dataset": selection.get(key), "expected": value}
+        for key, value in expected.items()
+        if selection.get(key) != value
+    }
+    if dataset.metadata.get("kind") != MANISKILL_HOPPER_DATASET_KIND:
+        raise ValueError("Formal dataset is not a ManiSkill HopperHop archive")
+    if dataset.metadata.get("task") != TASK or len(dataset) != FORMAL_OFFLINE_TRANSITIONS:
+        raise ValueError("Formal ManiSkill HopperHop dataset must contain exactly 200k transitions")
+    protocol = {
+        "environment_id": "MS-HopperHop-v1",
+        "episode_horizon": EPISODE_HORIZON,
+        "action_repeat": 1,
+        "control_mode": "pd_joint_delta_pos",
+        "reward_mode": "normalized_dense",
+        "reward_source": "recorded",
+    }
+    mismatches.update(
+        {
+            key: {"dataset": dataset.metadata.get(key), "expected": value}
+            for key, value in protocol.items()
+            if dataset.metadata.get(key) != value
+        }
+    )
+    if mismatches:
+        raise ValueError(f"Formal ManiSkill dataset contract differs: {mismatches}")
+    return dataset
+
+
+def validate_koopman(path: Path) -> FrozenKoopman:
+    model = FrozenKoopman(path.resolve())
+    if (model.state_dim, model.action_dim, model.lift_dim) != (15, 4, 48):
+        raise ValueError("ManiSkill Hopper Koopman dimensions must be 15/4/48")
+    metadata = model.metadata
+    if metadata.get("task") != TASK or metadata.get("state_kind") != "hopperhop":
+        raise ValueError("Koopman export is not the ManiSkill HopperHop model")
+    if metadata.get("k_step") != 20:
+        raise ValueError("Formal Koopman model must use K=20")
+    if metadata.get("reward_layer_count") != 0:
+        raise ValueError("Formal reused Koopman model must be reward-free")
+    source_path = Path(str(metadata.get("source_path", "")))
+    if not source_path.is_file() or file_sha256(source_path) != metadata.get("source_sha256"):
+        raise ValueError("Frozen Koopman export is not bound to its source checkpoint")
+    return model
+
+
+def training_command(
+    *, method: str, seed: int, dataset: OfflineDataset, koopman: FrozenKoopman,
+    output: Path, device: str,
+) -> list[str]:
+    config = O2OConfig(
+        task=TASK, method=method, environment_backend=BACKEND, seed=seed
+    )
+    command = [
+        sys.executable,
+        "-m", "experiments.dmc.o2o.train",
+        "--task", TASK,
+        "--environment-backend", BACKEND,
+        "--method", method,
+        "--dataset", str(dataset.path),
+        "--output-dir", str(output.resolve()),
+        "--seed", str(seed),
+        "--device", device,
+        "--kmpc-horizon", str(FORMAL_KMPC_HORIZON),
+        "--mpve-total-horizon", str(FORMAL_MPVE_HORIZON),
+        "--offline-updates", str(FORMAL_OFFLINE_UPDATES),
+        "--offline-eval-interval-updates", str(FORMAL_OFFLINE_EVAL_INTERVAL),
+        "--online-steps", str(FORMAL_ONLINE_TRANSITIONS),
+        "--eval-interval-online-steps", str(FORMAL_ONLINE_EVAL_INTERVAL),
+        "--eval-episodes", str(FORMAL_DIAGNOSTIC_EPISODES),
+    ]
+    if config.requires_koopman:
+        command.extend(("--koopman", str(koopman.path)))
+    if method in STRUCTURED_METHODS:
+        command.extend(
+            (
+                "--offline-actor-learning-rate",
+                str(STRUCTURED_OFFLINE_LEARNING_RATE),
+                "--offline-critic-learning-rate",
+                str(STRUCTURED_OFFLINE_LEARNING_RATE),
+            )
+        )
+    return command
+
+
+def session_name(seed: int, method: str) -> str:
+    return f"ms_hop_{seed}_{method}".lower().replace("-", "_")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--training-seed", type=int, choices=FORMAL_TRAINING_SEEDS, required=True
+    )
+    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--koopman", type=Path, required=True)
+    parser.add_argument("--run-root", type=Path, required=True)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--launch", action="store_true")
+    args = parser.parse_args()
+
+    dataset = validate_dataset(args.dataset)
+    koopman = validate_koopman(args.koopman)
+    seed_root = (args.run_root / f"seed_{args.training_seed}").resolve()
+    commands = {
+        method: training_command(
+            method=method,
+            seed=args.training_seed,
+            dataset=dataset,
+            koopman=koopman,
+            output=seed_root / method,
+            device=args.device,
+        )
+        for method in FORMAL_METHODS
+    }
+    plan = {
+        "kind": "acmpc_maniskill_hopper_hop_formal_seed_v1",
+        "task": TASK,
+        "environment_backend": BACKEND,
+        "environment_protocol": {
+            "environment_id": "MS-HopperHop-v1",
+            "episode_horizon": EPISODE_HORIZON,
+            "action_repeat": 1,
+            "control_mode": "pd_joint_delta_pos",
+            "reward_mode": "normalized_dense",
+            "sim_backend": "gpu",
+        },
+        "training_seed": args.training_seed,
+        "formal_training_seeds": list(FORMAL_TRAINING_SEEDS),
+        "methods": list(FORMAL_METHODS),
+        "dataset": {
+            "path": str(dataset.path), "sha256": dataset.sha256,
+            "transitions": len(dataset), "selection": dataset.metadata["selection"],
+        },
+        "koopman": {"path": str(koopman.path), "sha256": koopman.sha256},
+        "training": {
+            "offline_updates": FORMAL_OFFLINE_UPDATES,
+            "online_transitions": FORMAL_ONLINE_TRANSITIONS,
+            "offline_eval_interval_updates": FORMAL_OFFLINE_EVAL_INTERVAL,
+            "online_eval_interval_transitions": FORMAL_ONLINE_EVAL_INTERVAL,
+            "diagnostic_episodes_vectorized_on_gpu": FORMAL_DIAGNOSTIC_EPISODES,
+            "kmpc_horizon": FORMAL_KMPC_HORIZON,
+            "mpve_horizon": FORMAL_MPVE_HORIZON,
+            "structured_offline_actor_learning_rate": STRUCTURED_OFFLINE_LEARNING_RATE,
+            "structured_offline_critic_learning_rate": STRUCTURED_OFFLINE_LEARNING_RATE,
+            "online_actor_learning_rate": 3e-4,
+            "online_critic_learning_rate": 3e-4,
+        },
+        "commands": {method: shlex.join(command) for method, command in commands.items()},
+    }
+    _atomic_json(seed_root / "seed_plan.json", plan)
+    for method, command in commands.items():
+        print(f"{method}: {shlex.join(command)}", flush=True)
+        if not args.launch:
+            continue
+        output = seed_root / method
+        output.mkdir(parents=True, exist_ok=True)
+        name = session_name(args.training_seed, method)
+        exists = subprocess.run(
+            ["tmux", "has-session", "-t", name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode == 0
+        if exists:
+            print(f"existing tmux session retained: {name}", flush=True)
+            continue
+        log_path = output / "training.log"
+        shell_command = (
+            f"cd {shlex.quote(str(Path.cwd()))} && "
+            f"{shlex.join(command)} >> {shlex.quote(str(log_path))} 2>&1"
+        )
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", name, shell_command],
+            check=True,
+        )
+        print(f"launched tmux={name} log={log_path}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

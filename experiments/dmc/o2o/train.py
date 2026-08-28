@@ -42,9 +42,19 @@ DIAGNOSTIC_EVAL_SEED_BASE = 9_000_000
 from experiments.dmc.ppo.vector_env import make_dmc_vector_env
 
 
-def _dataset_action_repeat(task: str, dataset: OfflineDataset) -> int | None:
+def _dataset_action_repeat(
+    task: str, dataset: OfflineDataset, environment_backend: str = "dmc"
+) -> int | None:
     """Resolve an explicit outer-rate contract for recorded Hopper data."""
 
+    if environment_backend == "maniskill_hopper_hop":
+        if dataset.metadata.get("environment_id") != "MS-HopperHop-v1":
+            raise ValueError("ManiSkill O2O requires an MS-HopperHop-v1 dataset")
+        if dataset.metadata.get("episode_horizon") != 600:
+            raise ValueError("ManiSkill O2O requires the native 600-step horizon")
+        if dataset.metadata.get("action_repeat") != 1:
+            raise ValueError("ManiSkill O2O forbids action repeat")
+        return None
     if task != "hopper_hop":
         return None
     expected = {
@@ -69,9 +79,32 @@ def _validate_dataset_environment_protocol(
     task: str,
     dataset: OfflineDataset,
     protocol: dict[str, Any],
+    environment_backend: str = "dmc",
 ) -> None:
     """Fail before training if recorded transitions and live timing differ."""
 
+    if environment_backend == "maniskill_hopper_hop":
+        expected = {
+            "protocol_name": "maniskill_hopper_hop_native_v1",
+            "environment_id": "MS-HopperHop-v1",
+            "action_repeat": 1,
+            "step_limit": 600,
+            "observation_dim": 15,
+            "action_dim": 4,
+        }
+        mismatches = {
+            key: {"runtime": protocol.get(key), "expected": value}
+            for key, value in expected.items()
+            if protocol.get(key) != value
+        }
+        if dataset.metadata.get("episode_horizon") != protocol.get("step_limit"):
+            mismatches["dataset_episode_horizon"] = {
+                "runtime": protocol.get("step_limit"),
+                "dataset": dataset.metadata.get("episode_horizon"),
+            }
+        if mismatches:
+            raise ValueError(f"ManiSkill Hopper dataset/environment mismatch: {mismatches}")
+        return
     if task != "hopper_hop":
         return
     expected = {
@@ -318,6 +351,7 @@ def evaluate(
     episodes: int,
     seed_base: int,
     action_repeat: int | None = None,
+    environment_backend: str = "dmc",
 ) -> dict[str, Any]:
     if isinstance(episodes, bool) or not isinstance(episodes, int) or episodes < 1:
         raise ValueError("Evaluation episodes must be a positive integer")
@@ -329,12 +363,21 @@ def evaluate(
     vector_kwargs: dict[str, Any] = {"workers": 1}
     if action_repeat is not None:
         vector_kwargs["action_repeat"] = action_repeat
-    env = make_dmc_vector_env(
-        task,
-        episodes,
-        seed=seed_base,
-        **vector_kwargs,
-    )
+    if environment_backend == "maniskill_hopper_hop":
+        from experiments.hopper_hop.o2o_vector_env import (
+            make_maniskill_hopper_vector_env,
+        )
+
+        env = make_maniskill_hopper_vector_env(
+            task, episodes, seed=seed_base, workers=1
+        )
+    else:
+        env = make_dmc_vector_env(
+            task,
+            episodes,
+            seed=seed_base,
+            **vector_kwargs,
+        )
     try:
         observation = env.reset()
         totals = np.zeros(episodes, dtype=np.float64)
@@ -928,7 +971,9 @@ def run(
     output.mkdir(parents=True, exist_ok=True)
     metrics_path = output / "metrics.jsonl"
     dataset = OfflineDataset.load(dataset_path)
-    environment_action_repeat = _dataset_action_repeat(config.task, dataset)
+    environment_action_repeat = _dataset_action_repeat(
+        config.task, dataset, config.environment_backend
+    )
     dataset_task = dataset.metadata.get("task")
     if dataset_task is not None and dataset_task != config.task:
         raise ValueError(
@@ -969,14 +1014,22 @@ def run(
         observation_normalizer = FrozenObservationNormalizer.from_offline_observations(
             dataset.arrays["observation"], dataset_sha256=dataset.sha256
         )
-    protocol_kwargs: dict[str, Any] = {"seed": config.seed}
-    if environment_action_repeat is not None:
-        protocol_kwargs["action_repeat"] = environment_action_repeat
-    protocol_env = make_dmc_adapter(config.task, **protocol_kwargs)
-    environment_protocol = protocol_env.protocol_metadata()
-    protocol_env.close()
+    if config.environment_backend == "maniskill_hopper_hop":
+        from experiments.hopper_hop.o2o_vector_env import ENVIRONMENT_PROTOCOL
+
+        environment_protocol = dict(ENVIRONMENT_PROTOCOL)
+    else:
+        protocol_kwargs: dict[str, Any] = {"seed": config.seed}
+        if environment_action_repeat is not None:
+            protocol_kwargs["action_repeat"] = environment_action_repeat
+        protocol_env = make_dmc_adapter(config.task, **protocol_kwargs)
+        environment_protocol = protocol_env.protocol_metadata()
+        protocol_env.close()
     _validate_dataset_environment_protocol(
-        config.task, dataset, environment_protocol
+        config.task,
+        dataset,
+        environment_protocol,
+        config.environment_backend,
     )
 
     latest_path = output / "latest.pt"
@@ -1352,6 +1405,7 @@ def run(
             episodes=config.eval_episodes,
             seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
             action_repeat=environment_action_repeat,
+            environment_backend=config.environment_backend,
         )
         if initial_eval["return_mean"] > best_return:
             best_return = float(initial_eval["return_mean"])
@@ -1420,6 +1474,7 @@ def run(
                 episodes=config.eval_episodes,
                 seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
                 action_repeat=environment_action_repeat,
+                environment_backend=config.environment_backend,
             )
             save_milestone_checkpoint("offline")
             if diagnostic["return_mean"] > best_return:
@@ -1526,6 +1581,7 @@ def run(
                 episodes=config.eval_episodes,
                 seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
                 action_repeat=environment_action_repeat,
+                environment_backend=config.environment_backend,
             )
             if offline_eval["return_mean"] > best_return:
                 best_return = float(offline_eval["return_mean"])
@@ -1682,12 +1738,24 @@ def run(
     online_env_kwargs: dict[str, Any] = {"workers": config.env_workers}
     if environment_action_repeat is not None:
         online_env_kwargs["action_repeat"] = environment_action_repeat
-    env = make_dmc_vector_env(
-        config.task,
-        config.num_envs,
-        seed=config.seed + 100_000 + online_episode,
-        **online_env_kwargs,
-    )
+    if config.environment_backend == "maniskill_hopper_hop":
+        from experiments.hopper_hop.o2o_vector_env import (
+            make_maniskill_hopper_vector_env,
+        )
+
+        env = make_maniskill_hopper_vector_env(
+            config.task,
+            config.num_envs,
+            seed=config.seed + 100_000 + online_episode,
+            workers=config.env_workers,
+        )
+    else:
+        env = make_dmc_vector_env(
+            config.task,
+            config.num_envs,
+            seed=config.seed + 100_000 + online_episode,
+            **online_env_kwargs,
+        )
     if env.protocol != environment_protocol:
         env.close()
         raise ValueError("Vector collector protocol differs from checkpoint protocol")
@@ -1819,6 +1887,45 @@ def run(
                     )
                     online_episode += 1
             observations = vector_step.observation
+            # A 20k ManiSkill budget ends after 33 complete 600-step episodes
+            # plus a 200-step prefix.  Cal-QL cannot consume that prefix until
+            # it has a finite return-to-go boundary, so make the experiment
+            # budget an explicit dataset truncation.  This preserves exactly
+            # 20k real transitions without pretending the simulator timed out.
+            if (
+                online_step == config.online_steps
+                and pending_trajectory is not None
+                and pending_trajectory["reward"]
+            ):
+                transition_count = len(pending_trajectory["reward"])
+                replay.add_episode(
+                    np.asarray(pending_trajectory["observation"]),
+                    np.asarray(pending_trajectory["action"]),
+                    np.asarray(pending_trajectory["reward"]),
+                    np.asarray(pending_trajectory["discount"]),
+                    np.asarray(pending_trajectory["next_observation"]),
+                    gamma=config.discount,
+                )
+                for _ in range(transition_count):
+                    metrics = online_update()
+                for key in _PENDING_KEYS:
+                    pending_trajectory[key].clear()
+                completed_rows.append(
+                    {
+                        "phase": "online_episode",
+                        "offline_update": offline_update,
+                        "online_step": online_step,
+                        "episode": online_episode,
+                        "environment_index": 0,
+                        "environment_episode": online_episode,
+                        "reset_seed": int(-1),
+                        "episode_return": float(episode_returns[0]),
+                        "episode_length": int(episode_lengths[0]),
+                        "boundary": "formal_budget_truncation",
+                        **metrics,
+                    }
+                )
+                online_episode += 1
             for row in completed_rows:
                 _append_jsonl(metrics_path, row)
             at_reset_boundary = bool(reset_boundary.all())
@@ -1839,6 +1946,7 @@ def run(
                     episodes=config.eval_episodes,
                     seed_base=DIAGNOSTIC_EVAL_SEED_BASE,
                     action_repeat=environment_action_repeat,
+                    environment_backend=config.environment_backend,
                 )
                 row = {
                     "phase": "online_evaluation",
@@ -1889,8 +1997,34 @@ def run(
         env.close()
 
     if latest_checkpoint_online_step != online_step:
-        raise RuntimeError(
-            "Online training ended away from a checkpointable reset boundary"
+        # A completed 20k native-Hopper run deliberately ends 200 steps into
+        # its final 600-step episode.  It never needs simulator reconstruction:
+        # rerunning a completed checkpoint is the idempotent early return above.
+        if config.environment_backend != "maniskill_hopper_hop":
+            raise RuntimeError(
+                "Online training ended away from a checkpointable reset boundary"
+            )
+        atomic_torch_save(
+            latest_path,
+            _checkpoint_payload(
+                config=config,
+                dataset=dataset,
+                koopman=koopman,
+                observation_normalizer=observation_normalizer,
+                learner=learner,
+                replay=replay,
+                generator=generator,
+                phase="online",
+                offline_update=offline_update,
+                online_step=online_step,
+                online_episode=online_episode,
+                environment_protocol=environment_protocol,
+                best_return=best_return,
+                best_online_step=best_online_step,
+                initialization=initialization,
+                pending_trajectory=pending_trajectory,
+                online_extension=extension_metadata,
+            ),
         )
 
     run_metadata.update(
@@ -1916,6 +2050,11 @@ def parse_args() -> argparse.Namespace:
         "--task",
         choices=sorted(SUPPORTED_O2O_TASKS),
         default="cartpole_swingup",
+    )
+    parser.add_argument(
+        "--environment-backend",
+        choices=("dmc", "maniskill_hopper_hop"),
+        default="dmc",
     )
     parser.add_argument("--kmpc-horizon", type=int, default=20)
     parser.add_argument("--mpve-total-horizon", type=int, default=10)
@@ -1972,12 +2111,16 @@ def main() -> None:
     # 1000-step time limit.  A smoke run therefore uses exactly one episode
     # per vector member rather than ending after an unrecoverable partial 10
     # transitions.
-    smoke_online_steps = 1_000 * num_envs
+    smoke_episode_length = (
+        600 if args.environment_backend == "maniskill_hopper_hop" else 1_000
+    )
+    smoke_online_steps = smoke_episode_length * num_envs
     config = O2OConfig(
         method=args.method,
         seed=args.seed,
         device=args.device,
         task=args.task,
+        environment_backend=args.environment_backend,
         kmpc_horizon=args.kmpc_horizon,
         mpve_total_horizon=args.mpve_total_horizon,
         offline_updates=20 if args.smoke else args.offline_updates,
