@@ -275,4 +275,4 @@ class FeedforwardResidualKMPCTanhGaussianActor(nn.Module):
         log_prob = (
             normal_log_prob - correction - torch.log(half_range)
         ).sum(dim=-1)
-    return action, log_prob, plan if return_plan else None
+        return action, log_prob, plan if return_plan else None
