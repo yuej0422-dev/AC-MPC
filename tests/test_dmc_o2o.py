@@ -4,6 +4,7 @@ import copy
 import dataclasses
 import json
 import random
+import types
 from pathlib import Path
 
 import numpy as np
@@ -718,6 +719,109 @@ def test_lift_actor_is_an_mlp_and_awac_iql_updates_roundtrip(
         restored.update(_tensor_batch(), utd=1, phase="online")
 
 
+def test_awac_actor_update_interval_is_applied() -> None:
+    config = dataclasses.replace(
+        _small_config("AWAC"), actor_update_interval=2
+    )
+    learner = _raw_learner(config)
+    initial = copy.deepcopy(learner.actor.state_dict())
+
+    first = learner.update(_tensor_batch(), utd=1, phase="online")
+    assert first["actor_update_applied"] == 0.0
+    assert learner.actor_updates == 0
+    for key, value in learner.actor.state_dict().items():
+        torch.testing.assert_close(value, initial[key])
+
+    second = learner.update(_tensor_batch(), utd=1, phase="online")
+    assert second["actor_update_applied"] == 1.0
+    assert learner.actor_updates == 1
+    assert any(
+        not torch.equal(value, initial[key])
+        for key, value in learner.actor.state_dict().items()
+    )
+
+
+class _ActionValueCritic(torch.nn.Module):
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        del state
+        value = action[:, 0]
+        return value.unsqueeze(0).expand(2, -1)
+
+
+def _selective_awac_learner(mode: str, actions: list[float]) -> tuple[O2OLearner, TensorBatch]:
+    learner = _raw_learner(_small_config("AWAC"))
+    learner.critic = _ActionValueCritic()
+
+    def zero_policy(self, state, **kwargs):
+        del self, kwargs
+        action = torch.zeros(state.shape[0], 1, dtype=state.dtype)
+        return action, torch.zeros(state.shape[0]), None
+
+    learner._sample_actor_with_context = types.MethodType(zero_policy, learner)
+    probe = np.zeros((4, 5), dtype=np.float32)
+    probe[:, 1] = 1.0
+    learner.configure_awac_selectivity(
+        mode=mode,
+        reference_kl_weight=0.01 if mode == "positive_klref" else 0.0,
+        probe_observations=probe,
+    )
+    batch = _tensor_batch(len(actions))
+    batch.action = torch.tensor(actions, dtype=torch.float32).unsqueeze(-1)
+    return learner, batch
+
+
+def test_selective_awac_masks_and_selected_sample_normalization() -> None:
+    positive, batch = _selective_awac_learner(
+        "positive", [-0.5, -0.1, 0.2, 0.4]
+    )
+    metrics = positive._update_awac_actor(batch)
+    assert metrics["selected_sample_count"] == 2.0
+    assert metrics["selected_fraction"] == 0.5
+    assert metrics["advantage_positive_fraction"] == 0.5
+    assert metrics["selected_advantage_mean"] > 0
+    assert metrics["rejected_advantage_mean"] < 0
+    assert metrics["selected_policy_q_mean"] == pytest.approx(0.0)
+    assert metrics["rejected_policy_q_mean"] == pytest.approx(0.0)
+    assert metrics["rejected_data_q_mean"] == pytest.approx(-0.3)
+    assert metrics["actor_update_applied"] == 1.0
+
+    strong, strong_batch = _selective_awac_learner(
+        "positive_top50", [-0.1, 0.1, 0.2, 0.4]
+    )
+    strong_metrics = strong._update_awac_actor(strong_batch)
+    assert strong_metrics["advantage_positive_fraction"] == 0.75
+    assert strong_metrics["advantage_positive_top50_fraction"] == 0.5
+    assert strong_metrics["selected_sample_count"] == 2.0
+
+
+def test_selective_awac_empty_mask_skips_optimizer_step() -> None:
+    learner, batch = _selective_awac_learner(
+        "positive", [-0.5, -0.4, -0.2, -0.1]
+    )
+    initial = copy.deepcopy(learner.actor.state_dict())
+    metrics = learner._update_awac_actor(batch)
+    assert metrics["selected_sample_count"] == 0.0
+    assert metrics["actor_update_applied"] == 0.0
+    assert metrics["actor_selectivity_empty_batch"] == 1.0
+    assert learner.actor_updates == 0
+    for key, value in learner.actor.state_dict().items():
+        torch.testing.assert_close(value, initial[key])
+
+
+def test_selective_awac_source_reference_kl_activates_after_policy_moves() -> None:
+    learner, batch = _selective_awac_learner(
+        "positive_klref", [-0.5, -0.1, 0.2, 0.4]
+    )
+    initial = learner.awac_reference_probe_diagnostics()
+    assert initial["policy_kl_to_a3_reference"] == pytest.approx(0.0, abs=1e-8)
+    learner._update_awac_actor(batch)
+    moved = learner.awac_reference_probe_diagnostics()
+    assert moved["policy_kl_to_a3_reference"] > 0.0
+    second = learner._update_awac_actor(batch)
+    assert second["actor_reference_kl_value"] > 0.0
+    assert second["kl_grad_norm"] > 0.0
+
+
 def test_resolved_algorithm_semantics_are_fingerprinted_and_not_overridable() -> None:
     config = O2OConfig(method="Cal-QL-Raw")
     serialized = config.to_dict()
@@ -908,6 +1012,47 @@ def test_calrlpd_disables_calql_online_but_calql_raw_uses_all_valid_mc_rows() ->
     handle.remove()
     assert torch.isfinite(penalty)
     assert seen_batch_sizes == [8, 8, 8]  # K=2 proposals * all four MC-valid rows.
+
+
+def test_cql_uses_actor_physical_box_sampler_and_matching_density() -> None:
+    learner = _raw_learner(_small_calql_config())
+    batch = _tensor_batch()
+    cache = learner._prepare_critic_cache(batch, phase="offline")
+
+    def sample_uniform_actions(
+        _actor,
+        state: torch.Tensor,
+        *,
+        samples: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del generator
+        actions = torch.full(
+            (samples, state.shape[0], learner.action_dim),
+            0.125,
+            dtype=state.dtype,
+            device=state.device,
+        )
+        density = torch.full(
+            (samples, state.shape[0]),
+            4.25,
+            dtype=state.dtype,
+            device=state.device,
+        )
+        return actions, density
+
+    learner.actor.sample_uniform_actions = types.MethodType(  # type: ignore[attr-defined]
+        sample_uniform_actions, learner.actor
+    )
+    data_q = learner.critic(cache.state, batch.action)
+    penalty, metrics = learner._cql_calibrated_penalty(
+        batch, cache, data_q, phase="offline"
+    )
+
+    assert torch.isfinite(penalty)
+    assert metrics["cql_uses_physical_box"] == 1.0
+    assert metrics["cql_random_log_density_mean"] == pytest.approx(4.25)
+    assert metrics["cql_random_action_abs_max"] == pytest.approx(0.125)
 
 
 def test_raw_methods_fail_closed_against_koopman_and_record_normalizer(

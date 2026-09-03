@@ -75,6 +75,47 @@ def _clip(parameters: Any, optimizer: torch.optim.Optimizer) -> float:
     return float(value.detach())
 
 
+def _component_gradient_norm(
+    loss: torch.Tensor, parameters: tuple[nn.Parameter, ...], *, retain_graph: bool
+) -> float:
+    gradients = torch.autograd.grad(
+        loss,
+        parameters,
+        retain_graph=retain_graph,
+        allow_unused=True,
+    )
+    squared = torch.zeros((), device=loss.device)
+    for gradient in gradients:
+        if gradient is not None:
+            squared = squared + gradient.detach().square().sum()
+    return float(squared.sqrt().cpu())
+
+
+def _finite_subset_statistics(
+    prefix: str, values: torch.Tensor, mask: torch.Tensor
+) -> dict[str, float]:
+    subset = values[mask]
+    if subset.numel() == 0:
+        return {
+            f"{prefix}_count": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_p50": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_p95": 0.0,
+            f"{prefix}_p99": 0.0,
+            f"{prefix}_max": 0.0,
+        }
+    return {
+        f"{prefix}_count": float(subset.numel()),
+        f"{prefix}_mean": float(subset.mean()),
+        f"{prefix}_p50": float(torch.quantile(subset, 0.50)),
+        f"{prefix}_p90": float(torch.quantile(subset, 0.90)),
+        f"{prefix}_p95": float(torch.quantile(subset, 0.95)),
+        f"{prefix}_p99": float(torch.quantile(subset, 0.99)),
+        f"{prefix}_max": float(subset.max()),
+    }
+
+
 def _optimizer_to(
     optimizer: torch.optim.Optimizer, device: torch.device
 ) -> None:
@@ -134,20 +175,24 @@ class TensorBatch:
     next_observation: torch.Tensor
     mc_return: torch.Tensor
     offline_mask: torch.Tensor
+    previous_action: torch.Tensor | None = None
+    next_previous_action: torch.Tensor | None = None
+    behavior_clone_mask: torch.Tensor | None = None
 
     @classmethod
     def from_numpy(cls, batch: dict[str, np.ndarray], device: torch.device):
-        return cls(
-            **{
-                key: torch.as_tensor(batch[key], dtype=torch.float32, device=device)
-                for key in cls.__dataclass_fields__
-            }
-        )
+        values = {}
+        for key in cls.__dataclass_fields__:
+            if key in batch:
+                values[key] = torch.as_tensor(batch[key], dtype=torch.float32, device=device)
+        return cls(**values)
 
     def slice(self, index: slice) -> "TensorBatch":
-        return TensorBatch(
-            **{key: getattr(self, key)[index] for key in self.__dataclass_fields__}
-        )
+        values = {}
+        for key in self.__dataclass_fields__:
+            value = getattr(self, key)
+            values[key] = None if value is None else value[index]
+        return TensorBatch(**values)
 
 
 @dataclass(frozen=True)
@@ -246,19 +291,42 @@ class O2OLearner:
         # shared critic ensemble merely by consuming a different number of
         # default-generator draws while constructing the actor.
         with _cpu_initialization_stream(self.rng_substream_seeds["actor_init"]):
+            actor_options: dict[str, Any] = {
+                "actor_kind": config.method_spec.actor,
+                "network_profile": config.network_profile,
+                "state_dim": self.state_dim,
+                "action_dim": self.action_dim,
+                "hidden_dim": config.hidden_dim,
+                "controller_hidden_dim": config.controller_hidden_dim,
+                "kmpc_horizon": config.kmpc_horizon,
+                "kmpc_solver_iterations": config.kmpc_solver_iterations,
+                "controller_hidden_layers": config.controller_hidden_layers,
+            }
+            # ManiSoft's extended config adds physical-action and exploration
+            # controls. Keep this learner source compatible with legacy DMC
+            # configs while forwarding every field when the task-local config
+            # exposes it (including monkeypatched diagnostic actors).
+            if hasattr(config, "kmpc_log_std_init"):
+                actor_options.update(
+                    # ManiSoft baseline actors operate directly in the
+                    # physical residual coordinate.  The environment and
+                    # replay buffer use the agreed ±0.5 residual box.
+                    action_limit=(0.5 if config.task == "manisoft_circle" else 1.0),
+                    kmpc_delta_u_weight=config.kmpc_delta_u_weight,
+                    kmpc_delta_u_deadband=config.kmpc_delta_u_deadband,
+                    kmpc_delta_u_limit=config.kmpc_delta_u_limit,
+                    kmpc_log_std_init=config.kmpc_log_std_init,
+                    kmpc_log_std_max=config.kmpc_log_std_max,
+                )
             self.actor = build_actor(
                 config.method,
                 self.koopman,
-                actor_kind=config.method_spec.actor,
-                network_profile=config.network_profile,
-                state_dim=self.state_dim,
-                action_dim=self.action_dim,
-                hidden_dim=config.hidden_dim,
-                controller_hidden_dim=config.controller_hidden_dim,
-                kmpc_horizon=config.kmpc_horizon,
-                kmpc_solver_iterations=config.kmpc_solver_iterations,
-                controller_hidden_layers=config.controller_hidden_layers,
+                **actor_options,
             ).to(device)
+        # Opt-in online ablation: the real environment and Bellman target can
+        # remain rate-feasible while the reparameterized actor-loss sample is
+        # evaluated before the engineering adjacent-action projection.
+        self.actor_update_unbounded_action_rate = False
         with _cpu_initialization_stream(self.rng_substream_seeds["critic_init"]):
             self.critic = build_critic(
                 network_profile=config.network_profile,
@@ -274,8 +342,24 @@ class O2OLearner:
         self.log_temperature = nn.Parameter(
             torch.tensor(math.log(config.initial_temperature), device=device)
         )
+        actor_parameter_provider = getattr(
+            self.actor, "online_residual_parameters", None
+        )
+        actor_parameters = tuple(
+            actor_parameter_provider()
+            if callable(actor_parameter_provider)
+            else (
+                parameter
+                for parameter in self.actor.parameters()
+                if parameter.requires_grad
+            )
+        )
+        if not actor_parameters:
+            raise ValueError("Actor optimizer has no trainable parameters")
         self.actor_optimizer = _optimizer(
-            self.actor.parameters(), config.actor_learning_rate, config.gradient_clip_norm
+            actor_parameters,
+            config.actor_learning_rate,
+            config.gradient_clip_norm,
         )
         self.critic_optimizer = _optimizer(
             self.critic.parameters(),
@@ -300,7 +384,15 @@ class O2OLearner:
                 config.gradient_clip_norm,
             )
         self.gradient_updates = 0
+        # Count logical learner calls separately from critic gradient updates.
+        # With UTD>1, gradient_updates advances by UTD each call; scheduling
+        # actor updates from it would make intervals dividing UTD ineffective.
+        self.logical_updates = 0
         self.actor_updates = 0
+        self.awac_selectivity_mode: str | None = None
+        self.awac_reference_kl_weight = 0.0
+        self.awac_reference_actor: nn.Module | None = None
+        self.awac_reference_probe_observations: torch.Tensor | None = None
 
     @property
     def temperature(self) -> torch.Tensor:
@@ -343,6 +435,18 @@ class O2OLearner:
         )
         return action.cpu().numpy()
 
+    def _sample_actor_with_context(
+        self,
+        state: torch.Tensor,
+        *,
+        previous_action: torch.Tensor | None = None,
+        **kwargs: Any,
+    ):
+        """Sample an actor, optionally passing hidden action-rate context."""
+        if previous_action is None:
+            return self.actor.sample(state, **kwargs)
+        return self.actor.sample(state, previous_action=previous_action, **kwargs)
+
     @torch.no_grad()
     def _prepare_critic_cache(
         self,
@@ -356,8 +460,9 @@ class O2OLearner:
         next_state = self._encode(batch.next_observation)
         if self.config.uses_calql_in_phase(phase):
             sample_count = self.config.cql_actions
-            current_actions, current_log_prob, _ = self.actor.sample(
+            current_actions, current_log_prob, _ = self._sample_actor_with_context(
                 state,
+                previous_action=batch.previous_action,
                 samples=sample_count,
                 generator=self.training_generator,
             )
@@ -369,8 +474,9 @@ class O2OLearner:
                 if self.config.uses_calql_max_target_backup_in_phase(phase)
                 else 1
             )
-            next_actions, next_log_prob, _ = self.actor.sample(
+            next_actions, next_log_prob, _ = self._sample_actor_with_context(
                 next_state,
+                previous_action=batch.next_previous_action,
                 samples=target_sample_count + sample_count,
                 generator=self.training_generator,
             )
@@ -395,8 +501,9 @@ class O2OLearner:
                 cql_next_log_prob=next_log_prob[target_sample_count:].detach(),
             )
 
-        next_action, next_log_prob, _ = self.actor.sample(
+        next_action, next_log_prob, _ = self._sample_actor_with_context(
             next_state,
+            previous_action=batch.next_previous_action,
             generator=self.training_generator,
         )
         return CriticProposalCache(
@@ -549,9 +656,48 @@ class O2OLearner:
         sample_count = self.config.cql_actions
         expanded_state = calibrated_state.unsqueeze(0).expand(sample_count, -1, -1)
 
-        random_actions = torch.empty(
-            sample_count, batch_size, self.action_dim, device=self.device
-        ).uniform_(-1.0, 1.0, generator=self.training_generator)
+        physical_box_sampler = getattr(
+            self.actor, "sample_uniform_actions", None
+        )
+        if callable(physical_box_sampler):
+            # Structured physical-residual actors may have state-dependent
+            # feasible boxes.  CQL proposals and their density must use the
+            # same action coordinate/measure as policy and replay actions.
+            with torch.no_grad():
+                random_actions, random_log_density = physical_box_sampler(
+                    calibrated_state,
+                    samples=sample_count,
+                    generator=self.training_generator,
+                )
+            expected_action_shape = (
+                sample_count,
+                batch_size,
+                self.action_dim,
+            )
+            expected_density_shape = (sample_count, batch_size)
+            if random_actions.shape != expected_action_shape:
+                raise RuntimeError(
+                    "Physical-box CQL sampler returned actions with shape "
+                    f"{tuple(random_actions.shape)}, expected {expected_action_shape}"
+                )
+            if random_log_density.shape != expected_density_shape:
+                raise RuntimeError(
+                    "Physical-box CQL sampler returned log density with shape "
+                    f"{tuple(random_log_density.shape)}, expected "
+                    f"{expected_density_shape}"
+                )
+            uses_physical_box = True
+        else:
+            random_actions = torch.empty(
+                sample_count, batch_size, self.action_dim, device=self.device
+            ).uniform_(-1.0, 1.0, generator=self.training_generator)
+            random_log_density = torch.full(
+                (sample_count, batch_size),
+                -self.action_dim * math.log(2.0),
+                dtype=random_actions.dtype,
+                device=random_actions.device,
+            )
+            uses_physical_box = False
         proposals = (
             cache.cql_current_actions,
             cache.cql_current_log_prob,
@@ -583,10 +729,9 @@ class O2OLearner:
         # and the Bellman target are never clamped.
         q_current = torch.maximum(q_current, lower_bound)
         q_next = torch.maximum(q_next, lower_bound)
-        random_density = -self.action_dim * math.log(2.0)
         candidates = torch.cat(
             (
-                q_random - random_density,
+                q_random - random_log_density.unsqueeze(0),
                 q_current - current_log_prob.unsqueeze(0),
                 q_next - next_log_prob.unsqueeze(0),
             ),
@@ -599,6 +744,13 @@ class O2OLearner:
         return penalty, {
             "cql_penalty": float(penalty.detach()),
             "calibration_bound_rate": float(bound_rate.detach()),
+            "cql_random_log_density_mean": float(
+                random_log_density.detach().mean()
+            ),
+            "cql_random_action_abs_max": float(
+                random_actions.detach().abs().max()
+            ),
+            "cql_uses_physical_box": float(uses_physical_box),
         }
 
     def _mpve_target(
@@ -692,12 +844,45 @@ class O2OLearner:
             ):
                 target_parameter.lerp_(parameter, self.config.target_tau)
         self.gradient_updates += 1
+        offline_mask = batch.offline_mask.detach().reshape(-1) > 0.5
+        online_mask = ~offline_mask
+
+        def subset_mean(value: torch.Tensor, mask: torch.Tensor) -> float:
+            if not bool(mask.any()):
+                return float("nan")
+            if value.ndim == 2:
+                return float(value.detach()[:, mask].mean())
+            return float(value.detach()[mask].mean())
+
         return {
             "critic_loss": float(loss.detach()),
             "bellman_loss": float(bellman_loss.detach()),
             "critic_grad_norm": grad_norm,
+            "reward_mean": float(batch.reward.detach().mean()),
             "q_mean": float(q.detach().mean()),
             "target_q_mean": float(target.mean()),
+            "offline_q_mean": subset_mean(q, offline_mask),
+            "online_q_mean": subset_mean(q, online_mask),
+            "offline_target_q_mean": subset_mean(target, offline_mask),
+            "online_target_q_mean": subset_mean(target, online_mask),
+            "target_log_pi_mean": float(
+                cache.target_next_log_prob.detach().mean()
+            ),
+            "target_alpha_log_pi_mean": float(
+                (
+                    self.temperature.detach()
+                    * cache.target_next_log_prob.detach()
+                ).mean()
+            ),
+            "target_entropy_backup_mean": float(
+                (
+                    -self.temperature.detach()
+                    * cache.target_next_log_prob.detach()
+                ).mean()
+                if self.config.backup_entropy
+                else 0.0
+            ),
+            "backup_entropy_applied": float(self.config.backup_entropy),
             "mpve_applied": float(apply_mpve),
             "mpve_loss": float(mpve_loss.detach()),
             "mpve_target_mean": mpve_target_mean,
@@ -715,40 +900,222 @@ class O2OLearner:
             if state is None
             else state
         )
-        action, log_prob, _ = self.actor.sample(
-            state,
-            generator=self.training_generator,
+        if bool(getattr(self.actor, "frozen_cost_map", False)):
+            with torch.no_grad():
+                action, log_prob, _ = self._sample_actor_with_context(
+                    state,
+                    previous_action=batch.previous_action,
+                    generator=self.training_generator,
+                )
+                q = self._reduce_actor_q(self.critic(state, action))
+            return {
+                "actor_loss": 0.0,
+                "actor_rl_loss": float((-q).mean()),
+                "q_cost_anchor": 0.0,
+                "p_cost_anchor": 0.0,
+                "q_cost_anchor_term": 0.0,
+                "p_cost_anchor_term": 0.0,
+                "actor_update_applied": 0.0,
+                "actor_frozen": 1.0,
+                "actor_grad_norm": 0.0,
+                "entropy": float((-log_prob).mean()),
+                "actor_log_pi_mean": float(log_prob.mean()),
+                "actor_alpha_log_pi_mean": float(
+                    (self.temperature.detach() * log_prob).mean()
+                ),
+                "temperature": float(self.temperature.detach()),
+                "temperature_loss": 0.0,
+            }
+        rate_setter = getattr(self.actor, "set_max_action_delta", None)
+        saved_max_delta = getattr(self.actor, "max_action_delta", None)
+        unbounded_actor_sample = bool(
+            getattr(self, "actor_update_unbounded_action_rate", False)
+            and callable(rate_setter)
         )
+        if unbounded_actor_sample:
+            rate_setter(None)
+        try:
+            action, log_prob, _ = self._sample_actor_with_context(
+                state,
+                previous_action=batch.previous_action,
+                generator=self.training_generator,
+            )
+        finally:
+            if unbounded_actor_sample:
+                rate_setter(saved_max_delta)
         # The SAC policy needs dQ/da, but the actor step must neither calculate
         # nor retain gradients for critic parameters.
         self.critic_optimizer.zero_grad(set_to_none=True)
         self.actor_optimizer.zero_grad(set_to_none=True)
         with _frozen_parameters(self.critic):
             q = self._reduce_actor_q(self.critic(state, action))
-            actor_loss = (self.temperature.detach() * log_prob - q).mean()
+            actor_entropy_enabled = bool(
+                getattr(self, "actor_entropy_enabled", True)
+            )
+            actor_rl_loss = (
+                (
+                    self.temperature.detach() * log_prob
+                    if actor_entropy_enabled
+                    else torch.zeros_like(log_prob)
+                )
+                - q
+            ).mean()
+            anchor = getattr(self.actor, "cost_map_anchor", None)
+            if callable(anchor):
+                q_anchor, p_anchor = anchor(state)
+            else:
+                q_anchor = actor_rl_loss * 0.0
+                p_anchor = actor_rl_loss * 0.0
+            q_anchor_term = self.config.q_cost_anchor_weight * q_anchor
+            p_anchor_term = self.config.p_cost_anchor_weight * p_anchor
+            action_trust = actor_rl_loss * 0.0
+            action_trust_fn = getattr(self.actor, "action_trust_anchor", None)
+            if callable(action_trust_fn):
+                action_trust = action_trust_fn(state)
+            action_trust_weight = float(
+                getattr(
+                    self.actor,
+                    "action_trust_anchor_weight",
+                    self.config.action_trust_anchor_weight,
+                )
+            )
+            action_trust_term = action_trust_weight * action_trust
+            behavior_clone_loss = actor_rl_loss * 0.0
+            behavior_clone = getattr(self.actor, "behavior_action", None)
+            if self.config.offline_behavior_clone_weight > 0.0:
+                if not callable(behavior_clone):
+                    raise RuntimeError(
+                        "offline_behavior_clone_weight requires an actor "
+                        "behavior_action(state) implementation"
+                    )
+                behavior_action = behavior_clone(state)
+                if behavior_action.shape != batch.action.shape:
+                    raise RuntimeError(
+                        "behavior_action and replay action shapes differ: "
+                        f"{behavior_action.shape} != {batch.action.shape}"
+                    )
+                offline = batch.offline_mask.to(
+                    dtype=behavior_action.dtype,
+                    device=behavior_action.device,
+                )
+                selected = offline
+                if batch.behavior_clone_mask is not None:
+                    selected = selected * batch.behavior_clone_mask.to(
+                        dtype=behavior_action.dtype,
+                        device=behavior_action.device,
+                    )
+                per_row = (behavior_action - batch.action).square().sum(dim=-1)
+                behavior_clone_loss = (
+                    (per_row * selected).sum() / selected.sum().clamp_min(1.0)
+                )
+            behavior_clone_term = (
+                self.config.offline_behavior_clone_weight * behavior_clone_loss
+            )
+            actor_loss = (
+                actor_rl_loss
+                + q_anchor_term
+                + p_anchor_term
+                + action_trust_term
+                + behavior_clone_term
+            )
+            anchor_gradient_metrics: dict[str, float] = {}
+            if self.config.cost_anchor_gradient_diagnostics:
+                parameters = tuple(
+                    parameter
+                    for parameter in self.actor.parameters()
+                    if parameter.requires_grad
+                )
+
+                def component_grad_norm(loss: torch.Tensor) -> float:
+                    gradients = torch.autograd.grad(
+                        loss,
+                        parameters,
+                        retain_graph=True,
+                        allow_unused=True,
+                    )
+                    squared = sum(
+                        gradient.detach().square().sum()
+                        for gradient in gradients
+                        if gradient is not None
+                    )
+                    return float(torch.sqrt(squared))
+
+                anchor_gradient_metrics = {
+                    "actor_rl_grad_norm_unclipped": component_grad_norm(
+                        actor_rl_loss
+                    ),
+                    "q_anchor_grad_norm_unweighted": component_grad_norm(
+                        q_anchor
+                    ),
+                    "p_anchor_grad_norm_unweighted": component_grad_norm(
+                        p_anchor
+                    ),
+                }
             actor_loss.backward()
         actor_grad_norm = _clip(self.actor.parameters(), self.actor_optimizer)
         self.actor_optimizer.step()
 
-        temperature_loss = self._temperature_loss(log_prob)
-        self.temperature_optimizer.zero_grad(set_to_none=True)
-        temperature_loss.backward()
-        self.temperature_optimizer.step()
+        if actor_entropy_enabled:
+            temperature_loss = self._temperature_loss(log_prob)
+            self.temperature_optimizer.zero_grad(set_to_none=True)
+            temperature_loss.backward()
+            self.temperature_optimizer.step()
+        else:
+            temperature_loss = log_prob.detach().sum() * 0.0
         self.actor_updates += 1
         return {
             "actor_loss": float(actor_loss.detach()),
+            "actor_rl_loss": float(actor_rl_loss.detach()),
+            "q_cost_anchor": float(q_anchor.detach()),
+            "p_cost_anchor": float(p_anchor.detach()),
+            "q_cost_anchor_term": float(q_anchor_term.detach()),
+            "p_cost_anchor_term": float(p_anchor_term.detach()),
+            "action_trust_anchor": float(action_trust.detach()),
+            "action_trust_anchor_weight": action_trust_weight,
+            "action_trust_anchor_term": float(action_trust_term.detach()),
+            "offline_behavior_clone_loss": float(behavior_clone_loss.detach()),
+            "offline_behavior_clone_term": float(behavior_clone_term.detach()),
+            "offline_behavior_clone_weight": float(
+                self.config.offline_behavior_clone_weight
+            ),
+            "behavior_clone_selected_fraction": float(
+                (
+                    batch.offline_mask
+                    if batch.behavior_clone_mask is None
+                    else batch.offline_mask * batch.behavior_clone_mask
+                ).detach().mean()
+            ),
+            "actor_update_applied": 1.0,
+            **anchor_gradient_metrics,
             "actor_grad_norm": actor_grad_norm,
             "entropy": float((-log_prob).detach().mean()),
+            "actor_log_pi_mean": float(log_prob.detach().mean()),
+            "actor_alpha_log_pi_mean": float(
+                (self.temperature.detach() * log_prob.detach()).mean()
+            ),
             "temperature": float(self.temperature.detach()),
             "temperature_loss": float(temperature_loss.detach()),
+            "actor_entropy_enabled": float(actor_entropy_enabled),
+            "actor_update_unbounded_action_rate": float(unbounded_actor_sample),
         }
 
     def _data_action_log_prob(
-        self, state: torch.Tensor, action: torch.Tensor
+        self, state: torch.Tensor, action: torch.Tensor,
+        previous_action: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Log probability of replay actions under a tanh-Gaussian actor."""
 
-        location, log_std = self.actor.distribution(state)
+        actor_log_prob = getattr(self.actor, "data_action_log_prob", None)
+        if callable(actor_log_prob):
+            if previous_action is None:
+                return actor_log_prob(state, action)
+            return actor_log_prob(state, action, previous_action=previous_action)
+
+        location, log_std = (
+            self.actor.distribution(state, previous_action)
+            if previous_action is not None
+            else self.actor.distribution(state)
+        )
         pre_tanh = atanh_clipped(action)
         normal_log_prob = -0.5 * (
             ((pre_tanh - location) / log_std.exp()).square()
@@ -760,33 +1127,284 @@ class O2OLearner:
         )
         return (normal_log_prob - correction).sum(dim=-1)
 
+    @staticmethod
+    def _distribution_parameters(
+        actor: nn.Module,
+        state: torch.Tensor,
+        previous_action: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        result = (
+            actor.distribution(state, previous_action)
+            if previous_action is not None
+            else actor.distribution(state)
+        )
+        if not isinstance(result, tuple) or len(result) < 2:
+            raise TypeError("Actor distribution must return location and log_std")
+        return result[0], result[1]
+
+    def configure_awac_selectivity(
+        self,
+        *,
+        mode: str,
+        reference_kl_weight: float,
+        probe_observations: np.ndarray,
+    ) -> None:
+        """Configure a continuation-only selective AWAC actor objective."""
+
+        allowed = {"all", "positive", "positive_top50", "positive_klref"}
+        if self.config.learner_family != "awac":
+            raise ValueError("AWAC selectivity requires an AWAC learner")
+        if mode not in allowed:
+            raise ValueError(f"Unknown AWAC selectivity mode {mode!r}")
+        if not math.isfinite(reference_kl_weight) or reference_kl_weight < 0:
+            raise ValueError("AWAC reference KL weight must be finite and non-negative")
+        if mode == "positive_klref":
+            if reference_kl_weight <= 0:
+                raise ValueError("positive_klref requires a positive KL weight")
+        elif reference_kl_weight != 0:
+            raise ValueError("Reference KL weight is only valid for positive_klref")
+        probe = np.asarray(probe_observations, dtype=np.float32)
+        if probe.ndim != 2 or probe.shape[0] < 1 or not np.isfinite(probe).all():
+            raise ValueError("AWAC reference probe observations must be a finite matrix")
+
+        self.awac_selectivity_mode = mode
+        self.awac_reference_kl_weight = float(reference_kl_weight)
+        self.awac_reference_actor = copy.deepcopy(self.actor).to(self.device).eval()
+        for parameter in self.awac_reference_actor.parameters():
+            parameter.requires_grad_(False)
+        self.awac_reference_probe_observations = torch.as_tensor(
+            probe, dtype=torch.float32, device=self.device
+        )
+
+    def _awac_reference_kl(
+        self,
+        state: torch.Tensor,
+        previous_action: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.awac_reference_actor is None:
+            raise RuntimeError("AWAC reference actor has not been configured")
+        location, log_std = self._distribution_parameters(
+            self.actor, state, previous_action
+        )
+        with torch.no_grad():
+            reference_location, reference_log_std = self._distribution_parameters(
+                self.awac_reference_actor, state, previous_action
+            )
+        variance_ratio = torch.exp(2.0 * (log_std - reference_log_std))
+        mean_term = (location - reference_location).square() * torch.exp(
+            -2.0 * reference_log_std
+        )
+        return (
+            reference_log_std
+            - log_std
+            + 0.5 * (variance_ratio + mean_term - 1.0)
+        ).sum(dim=-1)
+
+    @torch.no_grad()
+    def awac_reference_probe_diagnostics(self) -> dict[str, float]:
+        if (
+            self.awac_reference_actor is None
+            or self.awac_reference_probe_observations is None
+        ):
+            return {}
+        state = self._encode(self.awac_reference_probe_observations).detach()
+        result = {
+            "policy_kl_to_a3_reference": float(self._awac_reference_kl(state).mean()),
+        }
+        current_terms = getattr(self.actor, "cost_terms", None)
+        reference_terms = getattr(self.awac_reference_actor, "cost_terms", None)
+        if not callable(current_terms) or not callable(reference_terms):
+            return result
+        q_state, q_action, p_state, p_action = current_terms(state)
+        ref_q_state, ref_q_action, ref_p_state, ref_p_action = reference_terms(state)
+        d_action = -p_action / q_action
+        ref_d_action = -ref_p_action / ref_q_action
+
+        def delta_statistics(prefix: str, value: torch.Tensor) -> dict[str, float]:
+            absolute = value.abs().reshape(-1)
+            return {
+                f"{prefix}_p50": float(torch.quantile(absolute, 0.50)),
+                f"{prefix}_p95": float(torch.quantile(absolute, 0.95)),
+                f"{prefix}_max": float(absolute.max()),
+            }
+
+        drift = {
+            **result,
+            **delta_statistics("delta_q_state", q_state - ref_q_state),
+            **delta_statistics("delta_p_state", p_state - ref_p_state),
+            **delta_statistics("delta_d_action", d_action - ref_d_action),
+        }
+        current_implicit = getattr(self.actor, "implicit_xyz_diagnostics", None)
+        reference_implicit = getattr(
+            self.awac_reference_actor, "implicit_xyz_diagnostics", None
+        )
+        if callable(current_implicit) and callable(reference_implicit):
+            current_values = current_implicit(state)
+            reference_values = reference_implicit(state)
+            for output_key, metric_key in (
+                ("delta_d_xyz", "delta_D_output"),
+                ("delta_d_xyz_physical_m", "delta_D_physical_m"),
+                ("delta_d_xyz_utilization", "delta_D_utilization"),
+                ("q_xyz_over_base", "delta_Q_over_base"),
+                ("d_action", "delta_d_action_implicit"),
+            ):
+                drift.update(
+                    delta_statistics(
+                        metric_key,
+                        current_values[output_key] - reference_values[output_key],
+                    )
+                )
+        drift["policy_kl_to_continuation_reference"] = drift[
+            "policy_kl_to_a3_reference"
+        ]
+        return drift
+
     def _update_awac_actor(self, batch: TensorBatch) -> dict[str, float]:
         state = self._encode(batch.observation).detach()
         with torch.no_grad():
             data_q = self._reduce_actor_q(self.critic(state, batch.action))
-            policy_action, _, _ = self.actor.sample(
+            policy_action, _, _ = self._sample_actor_with_context(
                 state, generator=self.training_generator
+                , previous_action=batch.previous_action
             )
-            value = self._reduce_actor_q(self.critic(state, policy_action))
-            advantage = data_q - value
+            policy_q = self._reduce_actor_q(self.critic(state, policy_action))
+            advantage = data_q - policy_q
             weights = torch.exp(
                 advantage / self.config.method_spec.advantage_temperature
             ).clamp(max=self.config.method_spec.advantage_weight_max)
-        log_prob = self._data_action_log_prob(state, batch.action)
-        actor_loss = -(weights * log_prob).mean()
+            median = torch.quantile(advantage, 0.50)
+            positive_mask = advantage > 0
+            strong_mask = positive_mask & (advantage >= median)
+            mode = self.awac_selectivity_mode or "all"
+            if mode == "all":
+                selected = torch.ones_like(positive_mask)
+            elif mode in {"positive", "positive_klref"}:
+                selected = positive_mask
+            elif mode == "positive_top50":
+                selected = strong_mask
+            else:
+                raise RuntimeError(f"Unsupported configured AWAC selectivity {mode!r}")
+        log_prob = self._data_action_log_prob(state, batch.action, batch.previous_action)
+        selected_count = int(selected.sum().item())
+        rejected = ~selected
+        weight_max = float(self.config.method_spec.advantage_weight_max)
+
+        quantiles = {
+            f"advantage_p{int(100*q):02d}": float(torch.quantile(advantage, q))
+            for q in (0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+        }
+        weight_quantiles = {
+            f"advantage_weight_p{int(100*q):02d}": float(torch.quantile(weights, q))
+            for q in (0.50, 0.90, 0.95, 0.99)
+        }
+        selected_weight_statistics = _finite_subset_statistics(
+            "selected_weight", weights, selected
+        )
+        subset_statistics: dict[str, float] = {}
+        for subset_name, subset_mask in (("selected", selected), ("rejected", rejected)):
+            for value_name, metric_value in (
+                ("data_q", data_q),
+                ("policy_q", policy_q),
+                ("advantage", advantage),
+                ("weight", weights),
+                ("reward", batch.reward),
+            ):
+                subset_statistics.update(
+                    _finite_subset_statistics(
+                        f"{subset_name}_{value_name}", metric_value, subset_mask
+                    )
+                )
+
+        common_metrics = {
+            "advantage_mean": float(advantage.mean()),
+            "advantage_std": float(advantage.std(unbiased=False)),
+            **quantiles,
+            "advantage_positive_fraction": float(positive_mask.float().mean()),
+            "advantage_positive_top50_fraction": float(strong_mask.float().mean()),
+            "selected_fraction": float(selected.float().mean()),
+            "selected_sample_count": float(selected_count),
+            "advantage_weight_mean": float(weights.mean()),
+            **weight_quantiles,
+            "advantage_weight_max": float(weights.max()),
+            "advantage_weight_max_hit_rate": float(
+                (weights >= weight_max * (1.0 - 1e-6)).float().mean()
+            ),
+            **selected_weight_statistics,
+            **subset_statistics,
+        }
+        if selected_count == 0:
+            return {
+                "actor_loss": 0.0,
+                "actor_awac_loss": 0.0,
+                "actor_reference_kl_loss": 0.0,
+                "actor_reference_kl_value": 0.0,
+                "actor_update_applied": 0.0,
+                "actor_selectivity_empty_batch": 1.0,
+                "actor_grad_norm": 0.0,
+                "awac_grad_norm": 0.0,
+                "kl_grad_norm": 0.0,
+                "shared_trunk_grad_norm": 0.0,
+                "q_state_head_grad_norm": 0.0,
+                "action_p_head_grad_norm": 0.0,
+                "entropy": float((-log_prob).detach().mean()),
+                "temperature": 0.0,
+                "temperature_loss": 0.0,
+                **common_metrics,
+            }
+
+        awac_loss = -(weights[selected] * log_prob[selected]).sum() / selected.sum()
+        reference_kl_value = log_prob.sum() * 0.0
+        reference_kl_loss = log_prob.sum() * 0.0
+        if mode == "positive_klref":
+            reference_kl_value = self._awac_reference_kl(
+                state, batch.previous_action
+            ).mean()
+            reference_kl_loss = self.awac_reference_kl_weight * reference_kl_value
+        actor_loss = awac_loss + reference_kl_loss
         self.actor_optimizer.zero_grad(set_to_none=True)
+        parameters = tuple(
+            parameter for parameter in self.actor.parameters() if parameter.requires_grad
+        )
+        awac_grad_norm = _component_gradient_norm(
+            awac_loss, parameters, retain_graph=True
+        )
+        kl_grad_norm = (
+            _component_gradient_norm(reference_kl_loss, parameters, retain_graph=True)
+            if mode == "positive_klref"
+            else 0.0
+        )
         actor_loss.backward()
+        headroom_gradient_metrics: dict[str, float] = {}
+        gradient_diagnostics = getattr(
+            self.actor, "action_headroom_gradient_diagnostics", None
+        )
+        if callable(gradient_diagnostics):
+            headroom_gradient_metrics = gradient_diagnostics()
+        selective_gradient_metrics: dict[str, float] = {}
+        selective_gradient_diagnostics = getattr(
+            self.actor, "selective_awac_gradient_diagnostics", None
+        )
+        if callable(selective_gradient_diagnostics):
+            selective_gradient_metrics = selective_gradient_diagnostics()
         actor_grad_norm = _clip(self.actor.parameters(), self.actor_optimizer)
         self.actor_optimizer.step()
         self.actor_updates += 1
         return {
             "actor_loss": float(actor_loss.detach()),
+            "actor_awac_loss": float(awac_loss.detach()),
+            "actor_reference_kl_loss": float(reference_kl_loss.detach()),
+            "actor_reference_kl_value": float(reference_kl_value.detach()),
+            "actor_selectivity_empty_batch": 0.0,
+            "actor_update_applied": 1.0,
             "actor_grad_norm": actor_grad_norm,
+            "awac_grad_norm": awac_grad_norm,
+            "kl_grad_norm": kl_grad_norm,
             "entropy": float((-log_prob).detach().mean()),
             "temperature": 0.0,
             "temperature_loss": 0.0,
-            "advantage_mean": float(advantage.mean()),
-            "advantage_weight_mean": float(weights.mean()),
+            **common_metrics,
+            **headroom_gradient_metrics,
+            **selective_gradient_metrics,
         }
 
     def _update_iql_once(self, batch: TensorBatch) -> dict[str, float]:
@@ -865,7 +1483,16 @@ class O2OLearner:
         utd: int,
         *,
         phase: Literal["offline", "online"],
+        actor_updates_enabled: bool = True,
+        actor_batch: TensorBatch | None = None,
     ) -> dict[str, float]:
+        """Apply critic updates from ``batch`` and an optional separate actor batch.
+
+        RLPD's critic sampling ratio and AWAC's behaviour-cloning target
+        distribution answer different questions.  Keeping the two tensors
+        separate makes an actor-replay composition screen causal while
+        preserving the critic's UTD/fused batch exactly.
+        """
         if phase not in ("offline", "online"):
             raise ValueError("phase must be exactly 'offline' or 'online'")
         if batch.reward.shape[0] % utd:
@@ -902,15 +1529,62 @@ class O2OLearner:
                 cache=mini_cache,
                 phase=phase,
             )
-        if self.config.learner_family == "awac":
-            metrics.update(self._update_awac_actor(mini_batch))
+        self.logical_updates += 1
+        metrics["offline_batch_fraction"] = float(
+            mini_batch.offline_mask.detach().mean()
+        )
+        metrics["online_batch_fraction"] = float(
+            1.0 - mini_batch.offline_mask.detach().mean()
+        )
+        actor_mini_batch = mini_batch if actor_batch is None else actor_batch
+        metrics["actor_offline_batch_fraction"] = float(
+            actor_mini_batch.offline_mask.detach().mean()
+        )
+        metrics["actor_online_batch_fraction"] = float(
+            1.0 - actor_mini_batch.offline_mask.detach().mean()
+        )
+        if not actor_updates_enabled:
+            metrics.update(
+                {
+                    "actor_update_applied": 0.0,
+                    "actor_frozen": 1.0,
+                    "actor_grad_norm": 0.0,
+                    "temperature_loss": 0.0,
+                }
+            )
+        elif self.logical_updates % self.config.actor_update_interval != 0:
+            metrics.update(
+                {
+                    "actor_update_applied": 0.0,
+                    "actor_update_interval": float(
+                        self.config.actor_update_interval
+                    ),
+                }
+            )
+        elif self.config.learner_family == "awac":
+            # AWAC used to bypass actor_update_interval entirely, making the
+            # advertised slow-actor online schedule ineffective.  Interval 1
+            # preserves the original/offline algorithm exactly; larger
+            # values now provide the same explicit scheduling contract used
+            # by the SAC-family learners.
+            actor_metrics = self._update_awac_actor(actor_mini_batch)
+            metrics.update(actor_metrics)
+            metrics.setdefault("actor_update_applied", 1.0)
         else:
+            actor_state = (
+                mini_cache.state
+                if actor_batch is None
+                else self._encode(actor_mini_batch.observation).detach()
+            )
             metrics.update(
                 self.update_actor_and_temperature(
-                    mini_batch,
-                    state=mini_cache.state,
+                    actor_mini_batch,
+                    state=actor_state,
                 )
             )
+        metrics["actor_update_interval"] = float(
+            self.config.actor_update_interval
+        )
         return metrics
 
     def state_dict(self) -> dict[str, Any]:
@@ -923,6 +1597,7 @@ class O2OLearner:
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "temperature_optimizer": self.temperature_optimizer.state_dict(),
             "gradient_updates": self.gradient_updates,
+            "logical_updates": self.logical_updates,
             "actor_updates": self.actor_updates,
             "representation": self.representation_identity(),
             # This is part of the scientific resume contract: initialization
@@ -985,12 +1660,49 @@ class O2OLearner:
                 "Learner sampling RNG device differs; training resume must use "
                 "the checkpoint device"
             )
-        self.actor.load_state_dict(state["actor"], strict=True)
+        actor_state = state["actor"]
+        augment_actor_state = getattr(
+            self.actor, "augment_policy_preserving_checkpoint_actor_state", None
+        )
+        actor_optimizer_state = state["actor_optimizer"]
+        if callable(augment_actor_state):
+            actor_state = augment_actor_state(actor_state)
+            # The inherited parameters keep their Adam moments exactly.  The
+            # appended zero adapter and frozen diagnostic source copy start
+            # without moments, which is Adam's canonical state for new
+            # parameters.  Remap by parameter position and retain the target
+            # optimizer's full parameter list.
+            source_optimizer = copy.deepcopy(actor_optimizer_state)
+            target_optimizer = self.actor_optimizer.state_dict()
+            if len(source_optimizer["param_groups"]) != len(
+                target_optimizer["param_groups"]
+            ):
+                raise ValueError("Policy-preserving optimizer group count differs")
+            identifier_map: dict[int, int] = {}
+            for source_group, target_group in zip(
+                source_optimizer["param_groups"],
+                target_optimizer["param_groups"],
+            ):
+                source_ids = list(source_group["params"])
+                target_ids = list(target_group["params"])
+                if len(source_ids) > len(target_ids):
+                    raise ValueError(
+                        "Policy-preserving actor has fewer parameters than its source"
+                    )
+                identifier_map.update(zip(source_ids, target_ids[: len(source_ids)]))
+                source_group["params"] = target_ids
+            source_optimizer["state"] = {
+                identifier_map[source_id]: value
+                for source_id, value in source_optimizer["state"].items()
+                if source_id in identifier_map
+            }
+            actor_optimizer_state = source_optimizer
+        self.actor.load_state_dict(actor_state, strict=True)
         self.critic.load_state_dict(state["critic"], strict=True)
         self.target_critic.load_state_dict(state["target_critic"], strict=True)
         with torch.no_grad():
             self.log_temperature.copy_(state["log_temperature"].to(self.device))
-        self.actor_optimizer.load_state_dict(state["actor_optimizer"])
+        self.actor_optimizer.load_state_dict(actor_optimizer_state)
         self.critic_optimizer.load_state_dict(state["critic_optimizer"])
         self.temperature_optimizer.load_state_dict(state["temperature_optimizer"])
         if self.value is not None:
@@ -1007,6 +1719,7 @@ class O2OLearner:
         for parameter in self.target_critic.parameters():
             parameter.requires_grad_(False)
         self.gradient_updates = int(state["gradient_updates"])
+        self.logical_updates = int(state.get("logical_updates", 0))
         self.actor_updates = int(state["actor_updates"])
         if restore_sampling_rng:
             try:

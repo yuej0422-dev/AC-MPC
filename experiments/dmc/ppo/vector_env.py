@@ -376,6 +376,7 @@ def _worker_main(
     index_offset: int,
     control_timestep: float | None,
     time_limit: float | None,
+    env_factory: EnvFactory | None,
 ) -> None:
     """Own one environment shard and serve reset/step requests."""
 
@@ -391,6 +392,7 @@ def _worker_main(
             seed,
             control_timestep=control_timestep,
             time_limit=time_limit,
+            env_factory=env_factory,
             _seed_stride=global_envs,
             _index_offset=index_offset,
         )
@@ -453,6 +455,7 @@ class ProcessDMCVectorEnv:
         control_timestep: float | None = None,
         time_limit: float | None = None,
         start_method: str = "spawn",
+        env_factory: EnvFactory | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError("num_envs must be positive")
@@ -486,6 +489,7 @@ class ProcessDMCVectorEnv:
                         offset,
                         control_timestep,
                         time_limit,
+                        env_factory,
                     ),
                     daemon=False,
                 )
@@ -656,8 +660,10 @@ def make_dmc_vector_env(
 
     # Synthetic test factories are frequently closures and intentionally stay
     # in-process. Real DMC runs use spawn workers unless explicitly set to one.
-    resolved_workers = 1 if env_factory is not None else (
-        default_env_workers(num_envs) if workers is None else int(workers)
+    resolved_workers = (
+        1
+        if env_factory is not None and workers is None
+        else default_env_workers(num_envs) if workers is None else int(workers)
     )
     if resolved_workers == 1:
         return SyncDMCVectorEnv(
@@ -668,8 +674,6 @@ def make_dmc_vector_env(
             time_limit=time_limit,
             env_factory=env_factory,
         )
-    if env_factory is not None:
-        raise ValueError("Custom env_factory only supports one in-process worker")
     return ProcessDMCVectorEnv(
         task_name,
         num_envs,
@@ -677,4 +681,5 @@ def make_dmc_vector_env(
         workers=resolved_workers,
         control_timestep=control_timestep,
         time_limit=time_limit,
+        env_factory=env_factory,
     )

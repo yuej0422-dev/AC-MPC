@@ -36,3 +36,4 @@ wandb/
 /private_notes/
 *.private.md
 prompt.md
+artifacts/
