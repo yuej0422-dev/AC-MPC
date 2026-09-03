@@ -17,7 +17,21 @@ from typing import Any, Literal
 from experiments.dmc.tasks.registry import get_task_spec
 
 
-SUPPORTED_O2O_TASKS = frozenset({"cartpole_swingup", "walker_run"})
+SUPPORTED_O2O_TASKS = frozenset(
+    {"cartpole_swingup", "walker_run", "manisoft_circle"}
+)
+
+
+def o2o_action_limit(task: str) -> float:
+    """Return the action-coordinate limit used by an O2O task."""
+
+    if task == "manisoft_circle":
+        return 0.3
+    if task in SUPPORTED_O2O_TASKS:
+        return 1.0
+    raise ValueError(
+        f"Unsupported O2O task {task!r}; expected {sorted(SUPPORTED_O2O_TASKS)}"
+    )
 
 
 Representation = Literal["raw", "koopman_lifted"]
@@ -25,7 +39,7 @@ ActorQReduction = Literal["min", "mean"]
 TemperatureObjective = Literal["calql_log_alpha", "rlpd"]
 CriticHeadReduction = Literal["sum", "mean"]
 OnlineCQLMode = Literal["all_valid_mc", "off"]
-NetworkProfile = Literal["exorl_cql", "rlpd"]
+NetworkProfile = Literal["exorl_cql", "rlpd", "plain"]
 MPVEScope = Literal["off", "offline_only", "online_only", "both"]
 LearnerFamily = Literal["sac", "awac", "iql"]
 
@@ -361,6 +375,15 @@ class O2OConfig:
     online_cql_mode: OnlineCQLMode | None = None
     calql_max_target_backup: bool | None = None
     gradient_clip_norm: float = 10.0
+    actor_update_interval: int = 1
+    q_cost_anchor_weight: float = 0.0
+    p_cost_anchor_weight: float = 0.0
+    action_trust_anchor_weight: float = 0.0
+    # Optional actor regularizer on replay actions.  The default is exactly
+    # zero so existing experiments retain their original algorithm.  When
+    # enabled, only rows marked as offline contribute to the regularizer.
+    offline_behavior_clone_weight: float = 0.0
+    cost_anchor_gradient_diagnostics: bool = False
 
     # 500k matches the public ExORL optimization budget.  Cal-QL-Raw uses the
     # official-derived 2Q core; Cal-RLPD methods use calibrated pretraining
@@ -382,6 +405,17 @@ class O2OConfig:
 
     kmpc_horizon: int = 20
     kmpc_solver_iterations: int = 20
+    kmpc_delta_u_weight: float = 0.0
+    kmpc_delta_u_deadband: float = 0.0
+    kmpc_delta_u_limit: float = 0.0
+    kmpc_log_std_init: float = 0.0
+    kmpc_log_std_max: float = 2.0
+
+    reward_mode: str = "sparse"
+    sparse_reward_weight: float = 1.0
+    dense_reward_weight: float = 0.0
+    dense_reward_scale_m: float = 0.01
+
     mpve_total_horizon: int = 10
     mpve_loss_weight: float = 1.0
 
@@ -434,7 +468,14 @@ class O2OConfig:
                     f"Unsupported O2O task {self.task!r}; expected "
                     f"{sorted(SUPPORTED_O2O_TASKS)}"
                 )
-            action_dim = get_task_spec(self.task).action_dim
+            # ManiSoft is an O2O-only task and is intentionally not registered
+            # as a dm_control task. Keep its physical 18-D action contract at
+            # this representation boundary instead of forging a DMC entry.
+            action_dim = (
+                18
+                if self.task == "manisoft_circle"
+                else get_task_spec(self.task).action_dim
+            )
             if spec.temperature_objective == "calql_log_alpha":
                 resolved_entropy = -float(action_dim)
             elif spec.temperature_objective == "rlpd":
@@ -465,10 +506,13 @@ class O2OConfig:
             "mpve_total_horizon", "eval_interval_online_steps", "eval_episodes",
             "checkpoint_interval_updates", "log_interval_updates",
             "offline_eval_interval_updates",
+            "actor_update_interval",
         )
         for name in integer_fields:
             value = getattr(self, name)
-            minimum = 0 if name == "online_warmup_steps" else 1
+            minimum = 0 if name in {
+                "online_steps", "online_warmup_steps", "offline_updates"
+            } else 1
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 qualifier = "non-negative" if minimum == 0 else "positive"
                 raise ValueError(f"{name} must be a {qualifier} integer")
@@ -507,6 +551,42 @@ class O2OConfig:
             raise ValueError("offline_replay_ratio must lie in [0, 1]")
         if not math.isfinite(self.cql_weight) or self.cql_weight < 0:
             raise ValueError("cql_weight must be finite and nonnegative")
+        for name in (
+            "kmpc_delta_u_weight",
+            "kmpc_delta_u_deadband",
+            "kmpc_delta_u_limit",
+            "sparse_reward_weight",
+            "dense_reward_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.kmpc_log_std_init):
+            raise ValueError("kmpc_log_std_init must be finite")
+        if not math.isfinite(self.kmpc_log_std_max):
+            raise ValueError("kmpc_log_std_max must be finite")
+        if self.kmpc_log_std_init > self.kmpc_log_std_max:
+            raise ValueError("kmpc_log_std_init cannot exceed kmpc_log_std_max")
+        if not math.isfinite(self.dense_reward_scale_m) or self.dense_reward_scale_m <= 0:
+            raise ValueError("dense_reward_scale_m must be finite and positive")
+        if self.reward_mode not in ("sparse", "hybrid", "dense_xref", "dense_joint"):
+            raise ValueError("reward_mode must be sparse, hybrid, dense_xref, or dense_joint")
+        if self.reward_mode in ("dense_xref", "dense_joint") and (
+            self.sparse_reward_weight != 0 or self.dense_reward_weight <= 0
+        ):
+            raise ValueError(
+                "dense_xref/dense_joint reward requires sparse_reward_weight=0 and "
+                "dense_reward_weight>0"
+            )
+        for name in (
+            "q_cost_anchor_weight",
+            "p_cost_anchor_weight",
+            "action_trust_anchor_weight",
+            "offline_behavior_clone_weight",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
         if not math.isfinite(self.target_entropy):
             raise ValueError("target_entropy must be finite")
         spec = self.method_spec
@@ -534,7 +614,7 @@ class O2OConfig:
             raise ValueError("critic_head_reduction must be sum or mean")
         if self.online_cql_mode not in ("all_valid_mc", "off"):
             raise ValueError("Unknown online CQL mode")
-        if self.network_profile not in ("exorl_cql", "rlpd"):
+        if self.network_profile not in ("exorl_cql", "rlpd", "plain"):
             raise ValueError("Unknown network profile")
         if self.online_cql_mode == "all_valid_mc" and (
             not spec.calql or not spec.completed_online_returns
@@ -552,6 +632,15 @@ class O2OConfig:
     @property
     def requires_completed_online_returns(self) -> bool:
         return self.method_spec.completed_online_returns
+
+    @property
+    def requires_online_mc_returns(self) -> bool:
+        """Whether online collection must retain complete episode returns."""
+
+        return (
+            self.requires_completed_online_returns
+            or self.online_cql_mode == "all_valid_mc"
+        )
 
     @property
     def uses_offline_pretraining(self) -> bool:

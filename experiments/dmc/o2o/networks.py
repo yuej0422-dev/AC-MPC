@@ -141,6 +141,7 @@ class MLPActor(nn.Module):
         hidden_dim: int = 256,
         *,
         lifted_dim: int | None = None,
+        action_scale: float = 1.0,
     ):
         super().__init__()
         # ``lifted_dim`` is retained solely as a construction alias for older
@@ -160,6 +161,9 @@ class MLPActor(nn.Module):
             nn.Linear(hidden_dim, 2 * action_dim),
         )
         self.action_dim = action_dim
+        if not np.isfinite(action_scale) or action_scale <= 0:
+            raise ValueError("action_scale must be positive and finite")
+        self.action_scale = float(action_scale)
         nn.init.uniform_(self.net[-1].weight, -1e-3, 1e-3)
         nn.init.uniform_(self.net[-1].bias, -1e-3, 1e-3)
 
@@ -186,7 +190,37 @@ class MLPActor(nn.Module):
             sample_shape=sample_shape,
             generator=generator,
         )
+        action = self.action_scale * action
+        log_prob = log_prob - self.action_dim * math.log(self.action_scale)
         return action, log_prob, None
+
+    def data_action_log_prob(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        location, log_std = self.distribution(state)
+        normalized = (action / self.action_scale).clamp(-0.999, 0.999)
+        pre_tanh = atanh_clipped(normalized)
+        normal_log_prob = -0.5 * (
+            ((pre_tanh - location) / log_std.exp()).square()
+            + 2.0 * log_std
+            + math.log(2.0 * math.pi)
+        )
+        correction = 2.0 * (
+            math.log(2.0) - pre_tanh - F.softplus(-2.0 * pre_tanh)
+        )
+        return (normal_log_prob - correction).sum(dim=-1) - self.action_dim * math.log(self.action_scale)
+
+    def sample_uniform_actions(
+        self, state: torch.Tensor, *, samples: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (samples, *state.shape[:-1], self.action_dim)
+        action = torch.empty(shape, device=state.device, dtype=state.dtype)
+        action.uniform_(-self.action_scale, self.action_scale, generator=generator)
+        density = torch.full(
+            (samples, *state.shape[:-1]),
+            -self.action_dim * math.log(2.0 * self.action_scale),
+            device=state.device, dtype=state.dtype,
+        )
+        return action, density
 
 
 def _orthogonal_linear(module: nn.Module) -> None:
@@ -210,7 +244,7 @@ class ExORLCQLActor(nn.Module):
 
     DISTRIBUTION_PROFILE = "standard_single_tanh_gaussian_exorl_compat_v1"
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int) -> None:
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, *, action_scale: float = 1.0, zero_output: bool = False) -> None:
         super().__init__()
         self.policy = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -221,7 +255,16 @@ class ExORLCQLActor(nn.Module):
             nn.Linear(hidden_dim, 2 * action_dim),
         )
         self.action_dim = action_dim
+        if not np.isfinite(action_scale) or action_scale <= 0:
+            raise ValueError("action_scale must be positive and finite")
+        self.action_scale = float(action_scale)
         self.apply(_orthogonal_linear)
+        if zero_output:
+            final = self.policy[-1]
+            if not isinstance(final, nn.Linear):
+                raise RuntimeError("ExORL actor output layer is not linear")
+            nn.init.zeros_(final.weight)
+            nn.init.zeros_(final.bias)
 
     def distribution(self, state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         location, raw_log_std = self.policy(state).chunk(2, dim=-1)
@@ -246,7 +289,34 @@ class ExORLCQLActor(nn.Module):
             sample_shape=sample_shape,
             generator=generator,
         )
+        action = self.action_scale * action
+        log_prob = log_prob - self.action_dim * math.log(self.action_scale)
         return action, log_prob, None
+
+    def data_action_log_prob(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        location, log_std = self.distribution(state)
+        normalized = (action / self.action_scale).clamp(-0.999, 0.999)
+        pre_tanh = atanh_clipped(normalized)
+        normal_log_prob = -0.5 * (
+            ((pre_tanh - location) / log_std.exp()).square()
+            + 2.0 * log_std + math.log(2.0 * math.pi)
+        )
+        correction = 2.0 * (math.log(2.0) - pre_tanh - F.softplus(-2.0 * pre_tanh))
+        return (normal_log_prob - correction).sum(dim=-1) - self.action_dim * math.log(self.action_scale)
+
+    def sample_uniform_actions(
+        self, state: torch.Tensor, *, samples: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        shape = (samples, *state.shape[:-1], self.action_dim)
+        action = torch.empty(shape, device=state.device, dtype=state.dtype)
+        action.uniform_(-self.action_scale, self.action_scale, generator=generator)
+        density = torch.full(
+            (samples, *state.shape[:-1]),
+            -self.action_dim * math.log(2.0 * self.action_scale),
+            device=state.device, dtype=state.dtype,
+        )
+        return action, density
 
 
 def _condense_dynamics(
@@ -492,6 +562,40 @@ class ExORLCQLQEnsemble(nn.Module):
         return torch.stack([network(value)[..., 0] for network in self.q_nets], dim=0)
 
 
+class PlainQEnsemble(nn.Module):
+    """Original AWAC-style independent MLP critics without LayerNorm."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        *,
+        ensemble_size: int = 2,
+        hidden_dim: int = 256,
+        hidden_layers: int = 2,
+    ) -> None:
+        super().__init__()
+        if hidden_layers < 1 or ensemble_size < 1:
+            raise ValueError("PlainQEnsemble dimensions must be positive")
+        dimensions = [state_dim + action_dim] + [hidden_dim] * hidden_layers + [1]
+        self.ensemble_size = ensemble_size
+        self.q_nets = nn.ModuleList(
+            nn.Sequential(
+                *[
+                    layer
+                    for i, (left, right) in enumerate(zip(dimensions[:-1], dimensions[1:]))
+                    for layer in ((nn.Linear(left, right),) if i == len(dimensions) - 2 else (nn.Linear(left, right), nn.ReLU()))
+                ]
+            )
+            for _ in range(ensemble_size)
+        )
+        self.apply(_orthogonal_linear)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        value = torch.cat((state, action), dim=-1)
+        return torch.stack([network(value)[..., 0] for network in self.q_nets], dim=0)
+
+
 class ValueNetwork(nn.Module):
     """Two-layer state-value network used only by the IQL baseline."""
 
@@ -523,7 +627,15 @@ def build_actor(
     kmpc_horizon: int,
     kmpc_solver_iterations: int,
     controller_hidden_layers: int = 1,
+    action_limit: float = 1.0,
+    kmpc_delta_u_weight: float = 0.0,
+    kmpc_delta_u_deadband: float = 0.0,
+    kmpc_delta_u_limit: float = 0.0,
+    kmpc_log_std_init: float = 0.0,
+    kmpc_log_std_max: float = LOG_STD_MAX,
 ) -> nn.Module:
+    del kmpc_delta_u_weight, kmpc_delta_u_deadband
+    del kmpc_delta_u_limit, kmpc_log_std_init, kmpc_log_std_max
     if actor_kind is None:
         # Compatibility for older direct callers. New O2O code passes the
         # immutable MethodSpec actor kind so a lifted-state MLP is not
@@ -551,10 +663,15 @@ def build_actor(
     if actor_kind != "mlp":
         raise ValueError(f"Unknown actor kind {actor_kind!r}")
     if network_profile == "exorl_cql":
-        return ExORLCQLActor(state_dim, action_dim, hidden_dim)
+        return ExORLCQLActor(
+            state_dim, action_dim, hidden_dim, action_scale=action_limit,
+            zero_output=(action_limit < 0.999),
+        )
+    if network_profile == "plain":
+        return MLPActor(state_dim, action_dim, hidden_dim, action_scale=action_limit)
     if network_profile != "rlpd":
         raise ValueError(f"Unknown actor network profile {network_profile!r}")
-    return MLPActor(state_dim, action_dim, hidden_dim)
+    return MLPActor(state_dim, action_dim, hidden_dim, action_scale=action_limit)
 
 
 def build_critic(
@@ -568,6 +685,14 @@ def build_critic(
 ) -> nn.Module:
     if network_profile == "exorl_cql":
         return ExORLCQLQEnsemble(
+            state_dim,
+            action_dim,
+            ensemble_size=ensemble_size,
+            hidden_dim=hidden_dim,
+            hidden_layers=hidden_layers,
+        )
+    if network_profile == "plain":
+        return PlainQEnsemble(
             state_dim,
             action_dim,
             ensemble_size=ensemble_size,
