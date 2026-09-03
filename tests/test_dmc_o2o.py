@@ -42,6 +42,7 @@ from experiments.dmc.o2o.networks import (
 from experiments.dmc.o2o import train as train_module
 from experiments.dmc.o2o.train import (
     _load_offline_fork,
+    _pending_trajectory_state,
     _truncate_metrics_to_checkpoint,
     _validate_resume,
 )
@@ -844,6 +845,38 @@ def test_resolved_algorithm_semantics_are_fingerprinted_and_not_overridable() ->
         _ = changed.fingerprint
 
 
+def test_phase_specific_learning_rates_preserve_legacy_identity_and_switch() -> None:
+    legacy = _small_config("Cal-RLPD-Lift")
+    assert "offline_actor_learning_rate" not in legacy.to_dict()
+    assert "offline_critic_learning_rate" not in legacy.to_dict()
+
+    scheduled = dataclasses.replace(
+        legacy,
+        offline_actor_learning_rate=1e-4,
+        offline_critic_learning_rate=2e-4,
+    )
+    assert scheduled.fingerprint != legacy.fingerprint
+    assert scheduled.learning_rate_for_phase("actor", "offline") == 1e-4
+    assert scheduled.learning_rate_for_phase("critic", "offline") == 2e-4
+    assert scheduled.learning_rate_for_phase("actor", "online") == float(
+        scheduled.actor_learning_rate
+    )
+    assert scheduled.learning_rate_for_phase("critic", "online") == float(
+        scheduled.critic_learning_rate
+    )
+
+    learner = _raw_learner(dataclasses.replace(scheduled, method="Cal-RLPD"))
+    assert {group["lr"] for group in learner.actor_optimizer.param_groups} == {1e-4}
+    assert {group["lr"] for group in learner.critic_optimizer.param_groups} == {2e-4}
+    learner.set_phase_learning_rates("online")
+    assert {group["lr"] for group in learner.actor_optimizer.param_groups} == {
+        float(scheduled.actor_learning_rate)
+    }
+    assert {group["lr"] for group in learner.critic_optimizer.param_groups} == {
+        float(scheduled.critic_learning_rate)
+    }
+
+
 def test_calql_uses_exorl_network_layout_and_orthogonal_initialization() -> None:
     learner = _raw_learner(_small_calql_config())
     assert isinstance(learner.actor, ExORLCQLActor)
@@ -1559,6 +1592,36 @@ def test_unified_mpve_owns_offline_pretraining_and_rejects_forks(
         koopman,
         environment_protocol,
     )
+    empty_pending = {key: [] for key in train_module._PENDING_KEYS}
+    assert _pending_trajectory_state(empty_pending) == {
+        "kind": "calql_pending_trajectory_v1",
+        "count": 0,
+        "arrays": {},
+    }
+    legacy_empty = copy.deepcopy(checkpoint)
+    legacy_empty["online_pending_trajectory"]["arrays"] = {
+        key: np.empty((0,), dtype=np.float32)
+        for key in train_module._PENDING_KEYS
+    }
+    _validate_resume(
+        legacy_empty,
+        target_config,
+        dataset,
+        koopman,
+        environment_protocol,
+    )
+    invalid_pending = copy.deepcopy(legacy_empty)
+    invalid_pending["online_pending_trajectory"]["arrays"]["reward"] = np.ones(
+        (1,), dtype=np.float32
+    )
+    with pytest.raises(ValueError, match="unfinished trajectory"):
+        _validate_resume(
+            invalid_pending,
+            target_config,
+            dataset,
+            koopman,
+            environment_protocol,
+        )
     forked = copy.deepcopy(checkpoint)
     forked["initialization"] = {"kind": "acmpc_o2o_offline_fork_v1"}
     with pytest.raises(ValueError, match="Non-forking method"):
@@ -1706,7 +1769,11 @@ class _FakeLearner:
         self.action_dim = 1 if koopman is None else koopman.action_dim
         self.update_calls: list[tuple[int, str, int]] = []
         self.act_batch_shapes: list[tuple[int, ...]] = []
+        self.learning_rate_phases: list[str] = []
         self.__class__.instances.append(self)
+
+    def set_phase_learning_rates(self, phase: str) -> None:
+        self.learning_rate_phases.append(phase)
 
     def act(self, observation: np.ndarray, deterministic: bool) -> np.ndarray:
         del deterministic
