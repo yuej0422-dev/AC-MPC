@@ -1,5 +1,23 @@
 #!/usr/bin/env python
-"""Time-only AWAC-KMPC reproduction with optional frozen feedforward."""
+"""ManiSoft Circle formal offline/online reproduction entry point.
+
+This is the reproduction driver referenced as ``$TRAINER`` by
+``manisoft_port/protocols/MANISOFT_CIRCLE_FORMAL_REPRODUCTION.md`` (archive
+copy: ``runs/o2o/formal/.../REPRODUCTION.md``).  It trains the time-residual
+ManiSoft Circle task, where the physical action is a frozen Koopman
+feedforward plus a learned residual:
+
+    physical_u = clip(u_ff(t) + residual_u, -0.5, 0.5)
+
+The file owns no training loop of its own.  It imports the shared circle O2O
+loop (``train_manisoft_circle_o2o``, re-exported by ``implicit_kmpc``) and
+monkey-patches the method specs, actor factory, dataset and task adapter so
+that every formal method (AWAC / IQL / Cal-QL / RLPD / AWAC-KMPC /
+AWAC-lift / AWAC-raw) is selected purely through CLI flags.  ``main()`` also
+locks the offline/online budget to a fixed protocol grid (formal archive:
+offline 10k updates, online 15k steps, evaluation/checkpoint every 2.5k)
+and writes ``time_only_protocol.json`` as an audit record.
+"""
 
 from __future__ import annotations
 
@@ -44,7 +62,10 @@ import experiments.dmc.o2o.config as config_module
 import experiments.dmc.o2o.learner as learner_module
 import antmaze_ac.envs.manisoft_circle_o2o_env as circle_env_module
 
+# Module-level actor/controller options, filled from the CLI in ``main()``.
+# ``training`` is the shared circle O2O loop object that this file patches.
 training = implicit_entry.training
+# Snapshot the untouched base implementations so main() can override them.
 _BASE_BUILD_ACTOR = learner_module.build_actor
 _BASE_GET_TASK_SPEC = learner_module.get_task_spec
 _BASE_ACTION_LIMIT = config_module.o2o_action_limit
@@ -99,7 +120,14 @@ def _learner_task_spec(task: str) -> Any:
     return _BASE_GET_TASK_SPEC(task)
 
 
+# --- Actor factory -------------------------------------------------------
+# Plain MLP actor for the official baselines; Koopman-lifted structured
+# QP-KMPC tanh-Gaussian actor for the ``*-KMPC`` arms.  The
+# ``--implicit-xyz-no-xref`` variant drops the global xref look-up and, with
+# ``--full-capacity-online-residual`` (C3 recipe), freezes the bootstrapped
+# actor and trains a same-capacity residual actor online.
 def _build_actor(method: str, koopman: Any, **kwargs: Any):
+    # Non-KMPC methods keep the untouched base MLP actor construction.
     if method not in {"AWAC-KMPC", "Cal-RLPD-KMPC"} or kwargs.get("actor_kind") != "ac_kmpc":
         return _BASE_BUILD_ACTOR(method, koopman, **kwargs)
     if koopman is None or _FEEDFORWARD is None or (
@@ -159,6 +187,11 @@ def _build_actor(method: str, koopman: Any, **kwargs: Any):
     )
 
 
+# --- Method registry -----------------------------------------------------
+# Materialize the REPRODUCTION.md method matrix from the standalone specs.
+# AWAC-KMPC is the Koopman-lifted KMPC arm (10-head LayerNorm critics,
+# UTD=20); AWAC-lift/AWAC-raw are its representation ablations; AWAC/IQL/
+# Cal-QL/RLPD stay close to their published baselines.
 def _register_method() -> None:
     # All arms use the same time-residual ManiSoft adapter and degraded ff15.
     # The official baselines retain their algorithmic update rules while the
@@ -175,9 +208,11 @@ def _register_method() -> None:
     )
     aliases: dict[str, Any] = {"AWAC": awac}
     # Standard IQL/Cal-QL use the raw normalized physical observation.  RLPD
-    # keeps its ten LayerNorm critics and UTD=20; offline pretraining is
-    # enabled here because this requested matrix has an explicit 30k offline
-    # phase for every arm.
+    # keeps its ten LayerNorm critics and UTD=20; ``offline_pretraining`` is
+    # enabled for matrix arms that request an explicit offline phase (e.g.
+    # the 30k/10k weighted-matrix point).  In the formal online-only campaign
+    # RLPD is launched with --offline-updates 0, so its offline row in
+    # REPRODUCTION.md is N/A.
     iql = replace(official["IQL"], network_profile="plain", profile="iql_official_raw_mlp_v2")
     calql = replace(official["Cal-QL"], profile="calql_official_raw_mlp_v2")
     rlpd = replace(official["RLPD"], offline_pretraining=True, profile="rlpd_official_raw_mlp_offline_screen_v2")
@@ -259,6 +294,10 @@ def _single_replay_batch(offline, online, *, batch_size, utd, offline_ratio, gen
 
 
 def main() -> None:
+    # This script parses its own small flag set; every remaining argument is
+    # forwarded to the shared O2O parser (--method, --offline-updates,
+    # --online-steps, learning rates, replay size, reward mode, ...).  The
+    # bash templates in REPRODUCTION.md combine both flag sets.
     global _FEEDFORWARD, _XREF, _RESIDUAL_LIMIT, _ACTION_COST_CENTER_LIMIT
     global _ACTION_HEADROOM_LIMIT, _ACTION_HEADROOM_ADAPTER_ONLY, _ACTIVE_VARIANT
     global _IMPLICIT_XYZ_NO_XREF, _IMPLICIT_XYZ_D_SCALE_M
@@ -379,6 +418,12 @@ def main() -> None:
     _ACTION_HEADROOM_ADAPTER_ONLY = bool(known.action_headroom_adapter_only)
     if _ACTION_HEADROOM_ADAPTER_ONLY and _ACTION_HEADROOM_LIMIT is None:
         raise ValueError("adapter-only mode requires policy-preserving headroom")
+    # --- Protocol budget guard -------------------------------------------
+    # (offline_updates, online_steps) is restricted to a fixed grid so a
+    # campaign cannot drift out of protocol.  The tuples include the formal
+    # REPRODUCTION.md budgets -- offline@10k => (10_000, 0), online@15k =>
+    # (0, 15_000) for the RLPD arm and (10_000, 15_000) for the arms
+    # bootstrapped from offline -- next to the earlier weighted-matrix points.
     if (args.offline_updates, args.online_steps) not in {
         (0, 0),
         (0, 5_000),
@@ -386,15 +431,17 @@ def main() -> None:
         (0, 10_000),
         (0, 12_500),
         (0, 14_000),
+        (0, 15_000),
         (0, 20_000),
+        (10_000, 0),
+        (10_000, 15_000),
         (20_000, 0),
         (20_000, 10_000),
         (30_000, 10_000),
     }:
         raise ValueError(
-            "protocol is fixed to offline=20k/online=0, "
-            "offline=0/online=5k, 7.5k, 10k, or 20k, or "
-            "offline=30k/online=10k"
+            "protocol is fixed to offline=10k, 20k or 30k/online=0/10k or "
+            "online=5k, 7.5k, 10k, 14k, 15k or 20k"
         )
     if args.kmpc_horizon != 5:
         raise ValueError("AWAC-KMPC freezes horizon at H=5")
@@ -439,6 +486,9 @@ def main() -> None:
     os.environ["ACMPC_MANISOFT_SPARSE_REWARD_WEIGHT"] = str(args.sparse_reward_weight)
     os.environ["ACMPC_MANISOFT_DENSE_REWARD_WEIGHT"] = str(args.dense_reward_weight)
     os.environ["ACMPC_MANISOFT_DENSE_REWARD_SCALE_M"] = str(args.dense_reward_scale_m)
+    # Install the circle-specific hooks onto the shared O2O loop/learner:
+    # residual action limit & task spec, actor factory, circle dataset,
+    # frozen Koopman wrapper, and the time-residual env adapter.
     config_module.o2o_action_limit = _action_limit
     learner_module.o2o_action_limit = _action_limit
     learner_module.build_actor = _build_actor
@@ -463,6 +513,9 @@ def main() -> None:
         training.O2OLearner = _ImplicitXyzSanityLearner
     control_entry.training = training
     training.evaluate = control_entry.evaluate_control_structure
+    # Persist an audit record of the resolved protocol/actor options next to
+    # the run output (``time_only_protocol.json``, plus an implicit-xyz JSON
+    # for no-xref arms) so archived runs can be audited later.
     protocol = {
         "kind": "manisoft_circle_weighted_offline_online_matrix_v1",
         "actor_input": (
@@ -559,6 +612,7 @@ def main() -> None:
         training._checkpoint_selection_key = lambda evaluation: (
             -float(evaluation["return_mean"]),
         )
+    # Delegate to the shared O2O loop with all hooks patched above.
     training.run(args)
 
 
